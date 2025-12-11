@@ -40,7 +40,6 @@ from nba_api.stats.endpoints import (
 
 # Seasons you want to maintain in your data folder
 SEASONS: List[str] = [
-    "2024-25",
     "2025-26",
 ]
 
