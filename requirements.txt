@@ -2,4 +2,4 @@ nba_api
 pandas
 numpy
 streamlit
-requests
+altair
