@@ -1027,7 +1027,7 @@ def team_tab():
     st.divider()
 
     # Team box score section
-    st.subheader("Team Box Scores (Pick a Game)")
+    st.subheader("Team Box Scores")
     if glog is None or glog.empty or "GAME_ID" not in glog.columns:
         st.info("No game log available for box score selection.")
     else:
