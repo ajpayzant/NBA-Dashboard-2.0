@@ -780,7 +780,7 @@ def league_tab():
             st.success("Cache cleared.")
 
     # Schedule section
-    st.subheader("Schedule (Upcoming + Completed)")
+    st.subheader("League Schedule")
     with st.spinner("Loading schedule..."):
         sched = get_schedule_range(start_date, int(days_ahead))
 
