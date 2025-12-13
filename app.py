@@ -1321,7 +1321,7 @@ def player_tab():
     st.divider()
 
     # Box scores (interactive)
-    st.markdown("### Box Scores (interactive)")
+    st.markdown("### Box Scores")
 
     logs2 = logs.copy()
     if "MATCHUP" in logs2.columns:
