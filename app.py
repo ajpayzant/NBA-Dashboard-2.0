@@ -1,9 +1,3 @@
-
----
-
-## 9) `app.py` (main app)
-
-```python
 from __future__ import annotations
 
 import datetime as dt
