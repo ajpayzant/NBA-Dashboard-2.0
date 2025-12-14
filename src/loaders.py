@@ -1,125 +1,196 @@
 from __future__ import annotations
 
 import datetime as dt
-from typing import Tuple, Optional
+from typing import Tuple
 
 import numpy as np
 import pandas as pd
 
 from nba_api.stats.static import teams as nba_teams_static
 from nba_api.stats.endpoints import (
+    scoreboardv2,
     leaguestandings,
     leaguedashteamstats,
     leaguedashplayerstats,
 )
 
+
 # ----------------------------
-# Helpers
+# Team lookup (TEAM_ID <-> ABBR)
 # ----------------------------
 
 def _teams_lookup_df() -> pd.DataFrame:
-    """Static NBA teams lookup (TEAM_ID -> TEAM_ABBREVIATION, TEAM_NAME)."""
     t = pd.DataFrame(nba_teams_static.get_teams())
-    # nba_api static teams columns: id, full_name, abbreviation, nickname, city, state, year_founded
-    t = t.rename(
-        columns={
-            "id": "TEAM_ID",
-            "abbreviation": "TEAM_ABBREVIATION",
-            "full_name": "TEAM_NAME",
-        }
-    )
+    t = t.rename(columns={"id": "TEAM_ID", "abbreviation": "TEAM_ABBREVIATION", "full_name": "TEAM_NAME"})
     t["TEAM_ID"] = pd.to_numeric(t["TEAM_ID"], errors="coerce")
     t["TEAM_ABBREVIATION"] = t["TEAM_ABBREVIATION"].astype(str)
     t["TEAM_NAME"] = t["TEAM_NAME"].astype(str)
     return t[["TEAM_ID", "TEAM_ABBREVIATION", "TEAM_NAME"]].dropna()
 
-def _coerce_team_abbr(df: pd.DataFrame) -> pd.DataFrame:
-    """Ensure TEAM_ABBREVIATION exists when possible."""
+
+def _ensure_team_abbr(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure TEAM_ABBREVIATION exists (derive from TEAM_ID via static lookup if needed)."""
     if df is None or df.empty:
         return df
 
     out = df.copy()
 
-    # Common alternative column names seen in some endpoints / versions
+    # normalize common alt names
     rename_map = {}
-    for c in out.columns:
-        if c.upper() in ("TEAM_ABBREV", "TEAM_ABBR", "ABBREVIATION"):
-            rename_map[c] = "TEAM_ABBREVIATION"
-        if c.upper() in ("TEAMID", "TEAM_ID"):
+    for c in list(out.columns):
+        cu = c.upper()
+        if cu in ("TEAMID", "TEAM_ID"):
             rename_map[c] = "TEAM_ID"
-        if c.upper() in ("TEAMNAME", "TEAM_NAME"):
+        if cu in ("TEAMNAME", "TEAM_NAME"):
             rename_map[c] = "TEAM_NAME"
+        if cu in ("TEAMABBREVIATION", "TEAM_ABBREVIATION", "TEAM_ABBR", "TEAM_ABBREV", "ABBREVIATION"):
+            rename_map[c] = "TEAM_ABBREVIATION"
     if rename_map:
         out = out.rename(columns=rename_map)
 
-    # If TEAM_ABBREVIATION missing but TEAM_ID exists, merge from lookup
-    if "TEAM_ABBREVIATION" not in out.columns:
-        if "TEAM_ID" in out.columns:
-            out["TEAM_ID"] = pd.to_numeric(out["TEAM_ID"], errors="coerce")
-            lk = _teams_lookup_df()
-            out = out.merge(lk, on="TEAM_ID", how="left", suffixes=("", "_LK"))
-            # If TEAM_NAME exists in original, keep it; else use lookup.
-            if "TEAM_NAME" not in df.columns and "TEAM_NAME_LK" in out.columns:
-                out["TEAM_NAME"] = out["TEAM_NAME_LK"]
-            if "TEAM_ABBREVIATION_LK" in out.columns:
-                out["TEAM_ABBREVIATION"] = out["TEAM_ABBREVIATION_LK"]
-            out = out.drop(columns=[c for c in ["TEAM_NAME_LK", "TEAM_ABBREVIATION_LK"] if c in out.columns])
+    # if missing ABBR but has TEAM_ID, join lookup
+    if "TEAM_ABBREVIATION" not in out.columns and "TEAM_ID" in out.columns:
+        out["TEAM_ID"] = pd.to_numeric(out["TEAM_ID"], errors="coerce")
+        lk = _teams_lookup_df()
+        out = out.merge(lk, on="TEAM_ID", how="left", suffixes=("", "_LK"))
+        if "TEAM_ABBREVIATION_LK" in out.columns:
+            out["TEAM_ABBREVIATION"] = out["TEAM_ABBREVIATION_LK"]
+        if "TEAM_NAME" not in df.columns and "TEAM_NAME_LK" in out.columns:
+            out["TEAM_NAME"] = out["TEAM_NAME_LK"]
+        out = out.drop(columns=[c for c in ["TEAM_ABBREVIATION_LK", "TEAM_NAME_LK"] if c in out.columns])
 
-    # Clean dtype
     if "TEAM_ABBREVIATION" in out.columns:
         out["TEAM_ABBREVIATION"] = out["TEAM_ABBREVIATION"].astype(str)
         out.loc[out["TEAM_ABBREVIATION"].isin(["nan", "None", "NA"]), "TEAM_ABBREVIATION"] = np.nan
 
     return out
 
-def _safe_merge_team(
-    left: pd.DataFrame,
-    right: pd.DataFrame,
-    how: str = "left",
-) -> pd.DataFrame:
+
+def _safe_merge_team(left: pd.DataFrame, right: pd.DataFrame, how: str = "left") -> pd.DataFrame:
     """
-    Merge standings/team stats safely.
-    Prefer TEAM_ABBREVIATION if present on both sides; else use TEAM_ID.
+    Merge two frames safely:
+      - Prefer TEAM_ID if present on both (most stable)
+      - Else use TEAM_ABBREVIATION if present on both
+      - Else return left unchanged
     """
-    left2 = _coerce_team_abbr(left)
-    right2 = _coerce_team_abbr(right)
+    l = _ensure_team_abbr(left)
+    r = _ensure_team_abbr(right)
 
-    # Prefer ABBR merge if both have it
-    if "TEAM_ABBREVIATION" in left2.columns and "TEAM_ABBREVIATION" in right2.columns:
-        l = left2.copy()
-        r = right2.copy()
-        l["TEAM_ABBREVIATION"] = l["TEAM_ABBREVIATION"].astype(str)
-        r["TEAM_ABBREVIATION"] = r["TEAM_ABBREVIATION"].astype(str)
-        return l.merge(r, on="TEAM_ABBREVIATION", how=how, suffixes=("", "_R"))
+    if "TEAM_ID" in l.columns and "TEAM_ID" in r.columns:
+        l2 = l.copy()
+        r2 = r.copy()
+        l2["TEAM_ID"] = pd.to_numeric(l2["TEAM_ID"], errors="coerce")
+        r2["TEAM_ID"] = pd.to_numeric(r2["TEAM_ID"], errors="coerce")
+        return l2.merge(r2, on="TEAM_ID", how=how, suffixes=("", "_R"))
 
-    # Else use TEAM_ID if possible
-    if "TEAM_ID" in left2.columns and "TEAM_ID" in right2.columns:
-        l = left2.copy()
-        r = right2.copy()
-        l["TEAM_ID"] = pd.to_numeric(l["TEAM_ID"], errors="coerce")
-        r["TEAM_ID"] = pd.to_numeric(r["TEAM_ID"], errors="coerce")
-        return l.merge(r, on="TEAM_ID", how=how, suffixes=("", "_R"))
+    if "TEAM_ABBREVIATION" in l.columns and "TEAM_ABBREVIATION" in r.columns:
+        l2 = l.copy()
+        r2 = r.copy()
+        l2["TEAM_ABBREVIATION"] = l2["TEAM_ABBREVIATION"].astype(str)
+        r2["TEAM_ABBREVIATION"] = r2["TEAM_ABBREVIATION"].astype(str)
+        return l2.merge(r2, on="TEAM_ABBREVIATION", how=how, suffixes=("", "_R"))
 
-    # If we cannot merge, just return left (app will show partial table)
-    return left2
+    return l
 
 
-# ----------------------------
-# Public fetchers used by app.py
-# ----------------------------
+# ============================
+# Functions app.py IMPORTS
+# ============================
+
+def fetch_daily_scoreboard(game_date: dt.date) -> pd.DataFrame:
+    """
+    One row per matchup:
+      - MATCHUP (AWY @ HOME)
+      - START_TIME_LOCAL
+      - STATUS (Final / Scheduled / In Progress)
+      - AWAY_SCORE / HOME_SCORE when available
+    """
+    # nba_api expects MM/DD/YYYY
+    dstr = game_date.strftime("%m/%d/%Y")
+    sb = scoreboardv2.ScoreboardV2(game_date=dstr).get_data_frames()
+
+    # ScoreboardV2 frames: [GameHeader, LineScore, SeriesStandings, ...]
+    if not sb or len(sb) < 2:
+        return pd.DataFrame()
+
+    gh = sb[0].copy()
+    ls = sb[1].copy()
+
+    # GameHeader has: GAME_ID, GAME_STATUS_TEXT, GAME_DATE_EST, GAME_SEQUENCE, LIVE_PERIOD, ...
+    # LineScore has: GAME_ID, TEAM_ID, TEAM_ABBREVIATION, PTS, etc.
+    gh = gh.rename(columns={"GAME_ID": "GAME_ID", "GAME_STATUS_TEXT": "STATUS"})
+    ls = _ensure_team_abbr(ls)
+
+    # build away/home rows from LineScore via GAME_ID + HOME_TEAM_ID/VISITOR_TEAM_ID in GameHeader
+    # GameHeader usually has HOME_TEAM_ID and VISITOR_TEAM_ID
+    for col in ["HOME_TEAM_ID", "VISITOR_TEAM_ID"]:
+        if col in gh.columns:
+            gh[col] = pd.to_numeric(gh[col], errors="coerce")
+
+    ls["TEAM_ID"] = pd.to_numeric(ls.get("TEAM_ID"), errors="coerce")
+
+    # map scores/abbr
+    away = ls.rename(columns={"PTS": "AWAY_SCORE", "TEAM_ABBREVIATION": "AWAY"})[["GAME_ID", "TEAM_ID", "AWAY", "AWAY_SCORE"]]
+    home = ls.rename(columns={"PTS": "HOME_SCORE", "TEAM_ABBREVIATION": "HOME"})[["GAME_ID", "TEAM_ID", "HOME", "HOME_SCORE"]]
+
+    out_rows = []
+    for _, g in gh.iterrows():
+        gid = g.get("GAME_ID")
+        home_id = g.get("HOME_TEAM_ID")
+        away_id = g.get("VISITOR_TEAM_ID")
+
+        hrow = home[home["GAME_ID"] == gid]
+        if pd.notna(home_id) and not hrow.empty:
+            hrow = hrow[hrow["TEAM_ID"] == home_id]
+        arow = away[away["GAME_ID"] == gid]
+        if pd.notna(away_id) and not arow.empty:
+            arow = arow[arow["TEAM_ID"] == away_id]
+
+        home_abbr = hrow["HOME"].iloc[0] if not hrow.empty else None
+        away_abbr = arow["AWAY"].iloc[0] if not arow.empty else None
+        home_pts = hrow["HOME_SCORE"].iloc[0] if not hrow.empty else np.nan
+        away_pts = arow["AWAY_SCORE"].iloc[0] if not arow.empty else np.nan
+
+        # start time
+        # GameHeader has GAME_DATE_EST (timestamp), or you might have GAME_TIME_EST depending on version
+        start_time = None
+        if "GAME_DATE_EST" in gh.columns and pd.notna(g.get("GAME_DATE_EST")):
+            try:
+                # often already datetime-like; keep as string
+                start_time = pd.to_datetime(g["GAME_DATE_EST"]).strftime("%Y-%m-%d %I:%M %p")
+            except Exception:
+                start_time = str(g.get("GAME_DATE_EST"))
+
+        matchup = None
+        if away_abbr and home_abbr:
+            matchup = f"{away_abbr} @ {home_abbr}"
+
+        out_rows.append(
+            {
+                "GAME_ID": gid,
+                "MATCHUP": matchup,
+                "START_TIME_LOCAL": start_time,
+                "STATUS": g.get("STATUS"),
+                "AWAY": away_abbr,
+                "HOME": home_abbr,
+                "AWAY_SCORE": away_pts,
+                "HOME_SCORE": home_pts,
+            }
+        )
+
+    out = pd.DataFrame(out_rows)
+    # nice formatting: show scores only when they exist
+    return out
+
 
 def fetch_league_team_summary(season: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Returns:
-      team_table: Standings + Team Stats (per game)
-      opp_table:  Opponent allowed stats (per game), if available
+      team_table: Standings + Team Stats (sortable)
+      opp_table:  Standings + Opponent allowed stats
     """
     # Standings
-    st = leaguestandings.LeagueStandings(season=season, season_type="Regular Season").get_data_frames()[0]
-    st = st.copy()
-
-    # Normalize expected cols
-    # LeagueStandings usually has: TeamID, TeamName, TeamAbbreviation, WINS, LOSSES, WinPCT, Conference, ...
+    st = leaguestandings.LeagueStandings(season=season, season_type="Regular Season").get_data_frames()[0].copy()
     st = st.rename(
         columns={
             "TeamID": "TEAM_ID",
@@ -131,46 +202,40 @@ def fetch_league_team_summary(season: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
             "Conference": "CONFERENCE",
         }
     )
-    st = _coerce_team_abbr(st)
+    st = _ensure_team_abbr(st)
 
-    # Team stats (base) and opponent stats
-    # leaguedashteamstats returns multiple measures; we grab PerGame where possible
-    td = leaguedashteamstats.LeagueDashTeamStats(
+    # Team Base per game
+    base = leaguedashteamstats.LeagueDashTeamStats(
         season=season,
         season_type_all_star="Regular Season",
         per_mode_detailed="PerGame",
         measure_type_detailed_defense="Base",
-    ).get_data_frames()[0]
+    ).get_data_frames()[0].copy()
+    base = _ensure_team_abbr(base)
 
-    td = td.copy()
-    td = td.rename(columns={"TEAM_ID": "TEAM_ID", "TEAM_NAME": "TEAM_NAME", "TEAM_ABBREVIATION": "TEAM_ABBREVIATION"})
-    td = _coerce_team_abbr(td)
-
-    # Advanced team stats (optional but often present in same endpoint if you call again; keeping minimal)
+    # Team Advanced per game
     adv = leaguedashteamstats.LeagueDashTeamStats(
         season=season,
         season_type_all_star="Regular Season",
         per_mode_detailed="PerGame",
         measure_type_detailed_defense="Advanced",
-    ).get_data_frames()[0]
-    adv = adv.copy()
-    adv = _coerce_team_abbr(adv)
+    ).get_data_frames()[0].copy()
+    adv = _ensure_team_abbr(adv)
 
-    # Opponent (allowed) stats
+    # Opponent allowed per game
     opp = leaguedashteamstats.LeagueDashTeamStats(
         season=season,
         season_type_all_star="Regular Season",
         per_mode_detailed="PerGame",
         measure_type_detailed_defense="Opponent",
-    ).get_data_frames()[0]
-    opp = opp.copy()
-    opp = _coerce_team_abbr(opp)
+    ).get_data_frames()[0].copy()
+    opp = _ensure_team_abbr(opp)
 
-    # Merge standings + base + adv
-    merged = _safe_merge_team(st, td, how="left")
+    # Merge safely (NO blind merge on missing keys)
+    merged = _safe_merge_team(st, base, how="left")
     merged = _safe_merge_team(merged, adv, how="left")
 
-    # Clean up / keep your existing table behavior: if W/L exist, enforce ints
+    # normalize W/L
     if "W" in merged.columns:
         merged["W"] = pd.to_numeric(merged["W"], errors="coerce").fillna(0).astype(int)
     if "L" in merged.columns:
@@ -178,14 +243,21 @@ def fetch_league_team_summary(season: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if "WIN_PCT" in merged.columns:
         merged["WIN_PCT"] = pd.to_numeric(merged["WIN_PCT"], errors="coerce")
 
-    # Build opp table matched by TEAM_ID/ABBR safely
     opp_merged = _safe_merge_team(st, opp, how="left")
+    if "W" in opp_merged.columns:
+        opp_merged["W"] = pd.to_numeric(opp_merged["W"], errors="coerce").fillna(0).astype(int)
+    if "L" in opp_merged.columns:
+        opp_merged["L"] = pd.to_numeric(opp_merged["L"], errors="coerce").fillna(0).astype(int)
+    if "WIN_PCT" in opp_merged.columns:
+        opp_merged["WIN_PCT"] = pd.to_numeric(opp_merged["WIN_PCT"], errors="coerce")
 
     return merged, opp_merged
 
 
-def fetch_league_player_leaders(season: str) -> pd.DataFrame:
-    """Leaguewide player leaders (per-game) used by League tab."""
+def fetch_league_player_stats(season: str) -> pd.DataFrame:
+    """
+    Leaguewide player table (per game) used for leader tables.
+    """
     df = leaguedashplayerstats.LeagueDashPlayerStats(
         season=season,
         season_type_all_star="Regular Season",
@@ -193,7 +265,8 @@ def fetch_league_player_leaders(season: str) -> pd.DataFrame:
         measure_type_detailed_defense="Base",
     ).get_data_frames()[0].copy()
 
-    # Normalize team col name for UI
+    # normalize common col names
     if "TEAM_ABBREVIATION" not in df.columns and "TEAM_ABBREV" in df.columns:
         df = df.rename(columns={"TEAM_ABBREV": "TEAM_ABBREVIATION"})
+
     return df
