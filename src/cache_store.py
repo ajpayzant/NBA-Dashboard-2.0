@@ -4,7 +4,7 @@ import os
 import time
 import json
 from dataclasses import dataclass
-from typing import Callable, Optional, List, Tuple
+from typing import Callable, Optional
 
 import pandas as pd
 
@@ -25,6 +25,42 @@ def _data_path(key: str) -> str:
 
 def _meta_path(key: str) -> str:
     return os.path.join(CACHE_DIR, _safe_key(key) + META_EXT)
+
+
+def list_cache_files() -> list[str]:
+    try:
+        return sorted([f for f in os.listdir(CACHE_DIR) if f.endswith(DATA_EXT) or f.endswith(META_EXT)])
+    except Exception:
+        return []
+
+
+def clear_cache_dir() -> None:
+    # Removes all cached parquet + meta files. Safe reset.
+    try:
+        for f in os.listdir(CACHE_DIR):
+            if f.endswith(DATA_EXT) or f.endswith(META_EXT):
+                try:
+                    os.remove(os.path.join(CACHE_DIR, f))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def clear_keys_with_prefix(prefix: str) -> None:
+    # Removes parquet + meta for any key file whose safe filename starts with safe(prefix)
+    sp = _safe_key(prefix)
+    try:
+        for f in os.listdir(CACHE_DIR):
+            if not (f.endswith(DATA_EXT) or f.endswith(META_EXT)):
+                continue
+            if f.startswith(sp):
+                try:
+                    os.remove(os.path.join(CACHE_DIR, f))
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 def read_parquet(key: str) -> Optional[pd.DataFrame]:
@@ -90,60 +126,3 @@ def get_or_refresh(
         return CacheResult(df=fresh, from_cache=False, refreshed=True)
 
     return CacheResult(df=df, from_cache=True, refreshed=False)
-
-
-# -----------------------------------------------------------------------------
-# Cache maintenance helpers
-# -----------------------------------------------------------------------------
-def delete_key(key: str) -> bool:
-    deleted = False
-    for p in (_data_path(key), _meta_path(key)):
-        try:
-            if os.path.exists(p):
-                os.remove(p)
-                deleted = True
-        except Exception:
-            pass
-    return deleted
-
-
-def clear_cache_dir() -> int:
-    n = 0
-    try:
-        for fname in os.listdir(CACHE_DIR):
-            if fname.endswith(DATA_EXT) or fname.endswith(META_EXT):
-                try:
-                    os.remove(os.path.join(CACHE_DIR, fname))
-                    n += 1
-                except Exception:
-                    pass
-    except Exception:
-        return n
-    return n
-
-
-def list_cache_files() -> List[str]:
-    try:
-        return sorted(os.listdir(CACHE_DIR))
-    except Exception:
-        return []
-
-
-# -----------------------------------------------------------------------------
-# Team boxscore disk keys
-# -----------------------------------------------------------------------------
-def team_boxscores_key(team_id: int, season: str) -> str:
-    return f"team_boxscores__{season}__{int(team_id)}"
-
-
-def read_team_boxscores(team_id: int, season: str) -> pd.DataFrame:
-    df = read_parquet(team_boxscores_key(team_id, season))
-    return df if df is not None else pd.DataFrame()
-
-
-def write_team_boxscores(team_id: int, season: str, df: pd.DataFrame) -> None:
-    write_parquet(team_boxscores_key(team_id, season), df)
-
-
-def team_boxscores_last_updated(team_id: int, season: str) -> Optional[int]:
-    return last_updated_ts(team_boxscores_key(team_id, season))
