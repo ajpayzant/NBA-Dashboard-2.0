@@ -4,12 +4,10 @@ import os
 import time
 import json
 from dataclasses import dataclass
-from typing import Callable, Optional, List
+from typing import Callable, Optional, List, Tuple
 
 import pandas as pd
 
-# Persistent on-disk cache directory (created automatically at runtime).
-# In Streamlit Cloud this will exist inside the container filesystem.
 CACHE_DIR = os.environ.get("NBA_DASH_CACHE_DIR", "data_cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
@@ -18,7 +16,6 @@ DATA_EXT = ".parquet"
 
 
 def _safe_key(key: str) -> str:
-    # filesystem-safe key
     return "".join(c if c.isalnum() or c in ("-", "_", ".") else "_" for c in key)
 
 
@@ -81,12 +78,6 @@ def get_or_refresh(
     normalize_fn: Optional[Callable[[pd.DataFrame], pd.DataFrame]] = None,
     force_refresh: bool = False,
 ) -> CacheResult:
-    """
-    Load from parquet if exists and not stale; otherwise fetch and store.
-
-    normalize_fn is applied to the dataframe both when fetched and when read,
-    to prevent dtype drift from breaking merges.
-    """
     df = None if force_refresh else read_parquet(key)
     if df is not None and normalize_fn is not None:
         df = normalize_fn(df)
@@ -102,10 +93,9 @@ def get_or_refresh(
 
 
 # -----------------------------------------------------------------------------
-# NEW: helpers for persistent cache maintenance (safe additive; doesn't affect app flow)
+# Cache maintenance helpers
 # -----------------------------------------------------------------------------
 def delete_key(key: str) -> bool:
-    """Delete a single cached dataset + metadata. Returns True if anything was deleted."""
     deleted = False
     for p in (_data_path(key), _meta_path(key)):
         try:
@@ -118,7 +108,6 @@ def delete_key(key: str) -> bool:
 
 
 def clear_cache_dir() -> int:
-    """Delete ALL parquet + meta files under CACHE_DIR. Returns number of files deleted."""
     n = 0
     try:
         for fname in os.listdir(CACHE_DIR):
@@ -134,7 +123,6 @@ def clear_cache_dir() -> int:
 
 
 def list_cache_files() -> List[str]:
-    """List filenames currently stored in CACHE_DIR (debug/diagnostics)."""
     try:
         return sorted(os.listdir(CACHE_DIR))
     except Exception:
@@ -142,14 +130,20 @@ def list_cache_files() -> List[str]:
 
 
 # -----------------------------------------------------------------------------
-# NEW: disk-only reader for preloaded team boxscores
+# Team boxscore disk keys
 # -----------------------------------------------------------------------------
-def read_boxscores(team_id: int, season: str) -> pd.DataFrame:
-    """
-    Read preloaded team boxscores (ALL games x ALL players for a team/season).
-    Produced by your preload script, stored as:
-      key = team_boxscores__{season}__{team_id}.parquet
-    """
-    key = f"team_boxscores__{season}__{int(team_id)}"
-    df = read_parquet(key)
+def team_boxscores_key(team_id: int, season: str) -> str:
+    return f"team_boxscores__{season}__{int(team_id)}"
+
+
+def read_team_boxscores(team_id: int, season: str) -> pd.DataFrame:
+    df = read_parquet(team_boxscores_key(team_id, season))
     return df if df is not None else pd.DataFrame()
+
+
+def write_team_boxscores(team_id: int, season: str, df: pd.DataFrame) -> None:
+    write_parquet(team_boxscores_key(team_id, season), df)
+
+
+def team_boxscores_last_updated(team_id: int, season: str) -> Optional[int]:
+    return last_updated_ts(team_boxscores_key(team_id, season))
