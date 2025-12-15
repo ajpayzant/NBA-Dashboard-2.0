@@ -219,16 +219,39 @@ def fetch_team_gamelog(team_id: int, season: str, timeout: int = 60) -> pd.DataF
     obj = teamgamelog.TeamGameLog(
         team_id=int(team_id),
         season=season,
-        season_type_all_star="Regular Season",
+        season_type="Regular Season",
         league_id_nullable="00",
         timeout=timeout,
     )
     df = _to_df(obj.get_data_frames(), 0)
     if df.empty:
         return df
+
+    # ---- Normalize column names across NBA API variations ----
+    rename_map = {}
+    if "Game_ID" in df.columns and "GAME_ID" not in df.columns:
+        rename_map["Game_ID"] = "GAME_ID"
+    if "GameDate" in df.columns and "GAME_DATE" not in df.columns:
+        rename_map["GameDate"] = "GAME_DATE"
+    if "Matchup" in df.columns and "MATCHUP" not in df.columns:
+        rename_map["Matchup"] = "MATCHUP"
+    if "W/L" in df.columns and "WL" not in df.columns:
+        rename_map["W/L"] = "WL"
+
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    # Ensure these exist even if missing
+    for c in ["GAME_ID", "GAME_DATE", "MATCHUP", "WL"]:
+        if c not in df.columns:
+            df[c] = pd.NA
+
     if "GAME_DATE" in df.columns:
         df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"], errors="coerce")
-    return df.sort_values("GAME_DATE", ascending=False).reset_index(drop=True)
+
+    # Sort newest first
+    df = df.sort_values("GAME_DATE", ascending=False).reset_index(drop=True)
+    return df
 
 
 def fetch_game_team_boxscore(game_id: str, team_id: int, timeout: int = 60) -> pd.DataFrame:
