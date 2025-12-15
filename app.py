@@ -1,15 +1,9 @@
 # app.py — NBA League / Team / Player Dashboard (Streamlit)
+# Updated: adds disk-backed pre-scrape caching for TEAM BOX SCORES (per team/season)
+# so users can flip through unlimited games without live API throttling.
 #
-# Goal: Preserve your original, full-featured app (League/Team/Player tabs)
-# while adding DISK-backed caching for TEAM BOX SCORES so users can flip through
-# unlimited games without triggering live NBA API calls (and getting throttled).
-#
-# Key change vs your original: the Team Box Scores section now:
-#   1) reads a team-season boxscore dataset from disk (parquet) if present
-#   2) if missing/incomplete, fetches only missing games ONCE, writes to disk
-#   3) then reads from disk for all future UI interactions
-#
-# No other UI behavior is intentionally changed.
+# This preserves the integrity/structure of your “good” app.py and only upgrades
+# the Team Box Scores section to use a parquet cache stored in data_cache/.
 
 import time
 import random
@@ -35,12 +29,8 @@ from nba_api.stats.endpoints import (
     playercareerstats,
 )
 
-# Disk cache helpers (your repo has src/cache_store.py)
-from src.cache_store import (
-    read_team_boxscores,
-    write_team_boxscores,
-    clear_cache_dir,
-)
+# NEW: disk cache for heavy endpoints (team box scores)
+from src.cache_store import read_parquet, write_parquet, clear_keys_with_prefix
 
 # ----------------------- Streamlit Setup -----------------------
 st.set_page_config(page_title="NBA Dashboard", layout="wide")
@@ -54,13 +44,6 @@ MAX_RETRIES = 6
 BASE_SLEEP = 1.25
 
 MIN_SECONDS_BETWEEN_CALLS = 1.0
-
-# Disk cache policy for boxscores:
-# - if team-season cache exists, use it
-# - if not, fetch missing games and write it
-# - optional: you can limit how many missing games get fetched per app run
-#   to reduce cold-start pain (but you asked to be able to flip freely).
-MAX_MISSING_BOX_SCORES_TO_FETCH_PER_RUN = 400  # basically "all"
 
 if "last_api_call_ts" not in st.session_state:
     st.session_state["last_api_call_ts"] = 0.0
@@ -211,24 +194,6 @@ def _rank_tile(col, label, value, rank, total=30, pct=False, decimals=1):
     )
 
 
-def _parse_min_to_float(x) -> float:
-    if pd.isna(x):
-        return np.nan
-    if isinstance(x, (int, float)):
-        return float(x)
-    s = str(x)
-    if ":" in s:
-        try:
-            mm, ss = s.split(":")
-            return float(mm) + float(ss) / 60.0
-        except Exception:
-            return np.nan
-    try:
-        return float(s)
-    except Exception:
-        return np.nan
-
-
 # ----------------------- Static team maps -----------------------
 @st.cache_data(ttl=CACHE_HOURS * 3600, show_spinner=False)
 def get_teams_static() -> pd.DataFrame:
@@ -358,7 +323,12 @@ def get_daily_scoreboard(game_date: dt.date) -> pd.DataFrame:
         status_display = status_text if status_text else "—"
         if pd.notna(status_id) and int(status_id) == 3 and pd.notna(home_pts) and pd.notna(away_pts):
             status_display = f"Final: {int(away_pts)}–{int(home_pts)}"
-        elif isinstance(status_text, str) and status_text.lower().startswith("final") and pd.notna(home_pts) and pd.notna(away_pts):
+        elif (
+            isinstance(status_text, str)
+            and status_text.lower().startswith("final")
+            and pd.notna(home_pts)
+            and pd.notna(away_pts)
+        ):
             status_display = f"{status_text}: {int(away_pts)}–{int(home_pts)}"
 
         out_rows.append(
@@ -518,91 +488,61 @@ def get_team_gamelog(team_id: int, season: str) -> pd.DataFrame:
             df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"], errors="coerce")
         return df.sort_values("GAME_DATE", ascending=False).reset_index(drop=True)
 
-    return pd.DataFrame()
+    # Fallback (rare)
+    tstatic = get_teams_static()
+    id2abbr = dict(zip(tstatic["TEAM_ID"].astype(int), tstatic["TEAM_ABBREVIATION"].astype(str)))
+    my_abbr = id2abbr.get(int(team_id), "")
 
-
-# ----------------------- NEW: Disk-cached Team Box Scores -----------------------
-def _fetch_single_game_players_boxscore(game_id: str) -> pd.DataFrame:
-    """
-    Fetch the Players table for a given game_id (BoxScoreTraditionalV2).
-    Returns DataFrame with at least columns: GAME_ID, TEAM_ABBREVIATION, PLAYER_ID, etc.
-    """
-    try:
-        frames = _retry_api(boxscoretraditionalv2.BoxScoreTraditionalV2, dict(game_id=str(game_id)))
-    except Exception:
-        return pd.DataFrame()
-
-    if not frames or len(frames) < 1:
-        return pd.DataFrame()
-
-    players = frames[0].copy()
-    if players is None or players.empty:
-        return pd.DataFrame()
-
-    players["GAME_ID"] = str(game_id)
-    return players
-
-
-def ensure_team_boxscores_cached(team_id: int, team_abbr: str, season: str, glog_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Ensures a disk parquet exists for all team boxscores in this team+season.
-
-    Strategy:
-      - read disk cache for (team_id, season)
-      - compare to game_ids in team_gamelog
-      - fetch only missing game_ids (Players table), filter to TEAM_ABBREVIATION
-      - append, de-dupe, write to disk
-      - return full cached df
-    """
-    disk = read_team_boxscores(team_id, season)
-    disk_game_ids = set(disk["GAME_ID"].astype(str).unique()) if (disk is not None and not disk.empty and "GAME_ID" in disk.columns) else set()
-
-    if glog_df is None or glog_df.empty or "GAME_ID" not in glog_df.columns:
-        return disk if disk is not None else pd.DataFrame()
-
-    wanted_game_ids = glog_df["GAME_ID"].dropna().astype(str).unique().tolist()
-    missing = [gid for gid in wanted_game_ids if gid not in disk_game_ids]
-
-    if not missing:
-        return disk
-
-    # Safety limit (usually "all")
-    missing = missing[:MAX_MISSING_BOX_SCORES_TO_FETCH_PER_RUN]
-
-    pulled = []
-    # Use a tight spinner scope inside caller (don’t spam UI here)
-    for gid in missing:
-        df = _fetch_single_game_players_boxscore(gid)
-        if df is None or df.empty:
+    start = dt.date.today() - dt.timedelta(days=200)
+    rows = []
+    for i in range(200):
+        d = start + dt.timedelta(days=i)
+        day = get_daily_scoreboard(d)
+        if day is None or day.empty:
             continue
-        if "TEAM_ABBREVIATION" in df.columns:
-            df = df[df["TEAM_ABBREVIATION"].astype(str) == str(team_abbr)].copy()
-        pulled.append(df)
 
-    if not pulled:
-        return disk if disk is not None else pd.DataFrame()
+        for r in day.itertuples(index=False):
+            matchup = getattr(r, "MATCHUP", "")
+            gid = getattr(r, "GAME_ID", "")
+            away_pts = getattr(r, "AWAY_PTS", np.nan)
+            home_pts = getattr(r, "HOME_PTS", np.nan)
 
-    new_df = pd.concat(pulled, ignore_index=True)
+            if not isinstance(matchup, str) or "@" not in matchup:
+                continue
+            if my_abbr and (my_abbr not in matchup):
+                continue
 
-    # Normalize dtypes
-    if "PLAYER_ID" in new_df.columns:
-        new_df["PLAYER_ID"] = pd.to_numeric(new_df["PLAYER_ID"], errors="coerce").astype("Int64")
+            away_abbr = matchup.split("@")[0].strip()
+            home_abbr = matchup.split("@")[1].strip()
 
-    if disk is None or disk.empty:
-        merged = new_df
-    else:
-        merged = pd.concat([disk, new_df], ignore_index=True)
+            wl = ""
+            if pd.notna(away_pts) and pd.notna(home_pts):
+                if my_abbr == away_abbr:
+                    wl = "W" if float(away_pts) > float(home_pts) else "L"
+                elif my_abbr == home_abbr:
+                    wl = "W" if float(home_pts) > float(away_pts) else "L"
 
-    # De-dupe: one row per (GAME_ID, PLAYER_ID)
-    if "GAME_ID" in merged.columns and "PLAYER_ID" in merged.columns:
-        merged["GAME_ID"] = merged["GAME_ID"].astype(str)
-        merged = merged.drop_duplicates(subset=["GAME_ID", "PLAYER_ID"], keep="last").reset_index(drop=True)
+            rows.append(
+                {
+                    "GAME_ID": str(gid),
+                    "GAME_DATE": pd.to_datetime(d),
+                    "MATCHUP": matchup,
+                    "WL": wl,
+                }
+            )
 
-    write_team_boxscores(team_id, season, merged)
-    return merged
+    if not rows:
+        return pd.DataFrame()
+
+    out = (
+        pd.DataFrame(rows)
+        .drop_duplicates(subset=["GAME_ID"])
+        .sort_values("GAME_DATE", ascending=False)
+        .reset_index(drop=True)
+    )
+    return out
 
 
-# ----------------------- Career summary -----------------------
 @st.cache_data(ttl=CACHE_HOURS * 3600, show_spinner=False)
 def get_career_summary(player_id: int) -> pd.DataFrame:
     try:
@@ -828,6 +768,87 @@ def _leader_table(df: pd.DataFrame, stat: str, n: int = 15) -> pd.DataFrame:
 
 
 # =====================================================================
+# NEW: DISK-BACKED TEAM BOX SCORE CACHE (per team_id + season)
+# =====================================================================
+def _parse_min_to_float(x):
+    if pd.isna(x):
+        return np.nan
+    if isinstance(x, (int, float)):
+        return float(x)
+    s = str(x)
+    if ":" in s:
+        try:
+            mm, ss = s.split(":")
+            return float(mm) + float(ss) / 60.0
+        except Exception:
+            return np.nan
+    try:
+        return float(s)
+    except Exception:
+        return np.nan
+
+
+def _boxscores_cache_key(team_id: int, season: str) -> str:
+    return f"team_boxscores__{season}__{int(team_id)}"
+
+
+def ensure_team_boxscores_cached(team_id: int, season: str, glog_df: pd.DataFrame, force_rebuild: bool = False) -> pd.DataFrame:
+    """
+    If cached exists, use it. Otherwise build it once by scraping all games in glog_df.
+    """
+    key = _boxscores_cache_key(team_id, season)
+
+    if force_rebuild:
+        clear_keys_with_prefix(key)
+
+    cached = read_parquet(key)
+    if cached is not None and not cached.empty:
+        return cached
+
+    if glog_df is None or glog_df.empty or "GAME_ID" not in glog_df.columns:
+        return pd.DataFrame()
+
+    game_ids = glog_df["GAME_ID"].astype(str).dropna().unique().tolist()
+    if not game_ids:
+        return pd.DataFrame()
+
+    all_rows = []
+    progress = st.progress(0.0)
+    status = st.empty()
+
+    total = len(game_ids)
+    for i, gid in enumerate(game_ids, start=1):
+        status.caption(f"Preloading box scores: {i}/{total} (game_id={gid})")
+        try:
+            frames = _retry_api(boxscoretraditionalv2.BoxScoreTraditionalV2, dict(game_id=str(gid)))
+            df = frames[0] if frames else pd.DataFrame()
+        except Exception:
+            df = pd.DataFrame()
+
+        if df is not None and not df.empty and "TEAM_ID" in df.columns:
+            df = df[df["TEAM_ID"] == int(team_id)].copy()
+            if not df.empty:
+                df["GAME_ID"] = str(gid)
+                all_rows.append(df)
+
+        progress.progress(min(1.0, i / total))
+
+    status.empty()
+    progress.empty()
+
+    if not all_rows:
+        return pd.DataFrame()
+
+    out = pd.concat(all_rows, ignore_index=True)
+    out["TEAM_ID"] = pd.to_numeric(out.get("TEAM_ID", np.nan), errors="coerce").astype("Int64")
+    out["PLAYER_ID"] = pd.to_numeric(out.get("PLAYER_ID", np.nan), errors="coerce").astype("Int64")
+    out["GAME_ID"] = out["GAME_ID"].astype(str)
+
+    write_parquet(key, out)
+    return out
+
+
+# =====================================================================
 # LEAGUE TAB
 # =====================================================================
 def league_tab():
@@ -843,8 +864,7 @@ def league_tab():
     with bar4:
         if st.button("Hard clear cache", key="lg_clear_cache"):
             st.cache_data.clear()
-            cleared = clear_cache_dir()
-            st.success(f"Streamlit cache cleared. Disk cache files removed: {cleared}")
+            st.success("Cache cleared.")
 
     tabA, tabB = st.tabs(["Teams", "Player Leaders"])
 
@@ -953,7 +973,7 @@ def league_tab():
 
 
 # =====================================================================
-# TEAM TAB
+# TEAM TAB (updated: box scores now disk-cached)
 # =====================================================================
 def team_tab():
     inject_rank_tile_css()
@@ -1082,7 +1102,7 @@ def team_tab():
 
     st.divider()
 
-    # ----------------------- Team Box Scores (DISK CACHED) -----------------------
+    # ------------------ UPDATED BOX SCORE SECTION (disk-cached) ------------------
     st.subheader("Team Box Scores (Pick a Game)")
 
     if glog is None or glog.empty or "GAME_ID" not in glog.columns:
@@ -1091,24 +1111,54 @@ def team_tab():
         glog2 = glog.copy()
         glog2["GAME_DATE"] = pd.to_datetime(glog2["GAME_DATE"], errors="coerce")
         glog2["GAME_DATE_STR"] = glog2["GAME_DATE"].dt.strftime("%Y-%m-%d")
-        glog2["LABEL"] = glog2["GAME_DATE_STR"].astype("string") + " | " + glog2["MATCHUP"].astype("string") + " | " + glog2.get("WL", "").astype("string")
+        glog2["LABEL"] = (
+            glog2["GAME_DATE_STR"].astype("string")
+            + " | "
+            + glog2["MATCHUP"].astype("string")
+            + " | "
+            + glog2.get("WL", "").astype("string")
+        )
 
-        gsel = st.selectbox("Select game", glog2["LABEL"].tolist(), index=0, key="tm_game_select")
+        cA, cB = st.columns([1.2, 1.0])
+        with cA:
+            gsel = st.selectbox("Select game", glog2["LABEL"].tolist(), index=0, key="tm_game_select")
+        with cB:
+            force_rebuild = st.button("Rebuild box score cache", key="tm_rebuild_box_cache")
+
         game_id = str(glog2[glog2["LABEL"] == gsel]["GAME_ID"].iloc[0])
 
-        # ✅ Ensure disk cache exists/complete (fetch missing ONCE, then reuse)
-        with st.spinner("Preparing boxscore cache (first time per team/season may take a bit)..."):
-            box_all = ensure_team_boxscores_cached(team_id, team_abbr, season, glog2)
+        with st.spinner("Loading box score cache (first time per team/season may take a bit)..."):
+            box_all = ensure_team_boxscores_cached(team_id, season, glog2, force_rebuild=force_rebuild)
 
         if box_all is None or box_all.empty:
-            st.info("No box score data available yet (API may be unavailable). Try another team or refresh later.")
+            st.info("No box score data cached for this team/season (API may be unavailable). Try rebuild later.")
         else:
             bx = box_all[box_all["GAME_ID"].astype(str) == str(game_id)].copy()
+
             if bx.empty:
-                st.info("That game’s box score is not stored yet. Try another game.")
+                st.info("That game’s box score is not in cache. Select another game or rebuild cache.")
             else:
-                keep = ["PLAYER_NAME", "START_POSITION", "MIN", "PTS", "REB", "AST", "FGM", "FGA", "FG3M", "FG3A",
-                        "FTM", "FTA", "OREB", "DREB", "STL", "BLK", "TO", "PF", "PLUS_MINUS"]
+                keep = [
+                    "PLAYER_NAME",
+                    "START_POSITION",
+                    "MIN",
+                    "PTS",
+                    "REB",
+                    "AST",
+                    "FGM",
+                    "FGA",
+                    "FG3M",
+                    "FG3A",
+                    "FTM",
+                    "FTA",
+                    "OREB",
+                    "DREB",
+                    "STL",
+                    "BLK",
+                    "TO",
+                    "PF",
+                    "PLUS_MINUS",
+                ]
                 bx = _ensure_cols(bx, keep)[keep].copy()
                 bx = bx.rename(columns={"TO": "TOV"})
                 for c in bx.columns:
@@ -1119,8 +1169,25 @@ def team_tab():
                 bx["PRA"] = bx["PTS"].fillna(0) + bx["REB"].fillna(0) + bx["AST"].fillna(0)
                 bx["FG2M"] = (bx["FGM"].fillna(0) - bx["FG3M"].fillna(0)).clip(lower=0)
 
-                show_cols = ["PLAYER_NAME", "START_POSITION", "MIN", "PTS", "REB", "AST", "PRA", "FG2M", "FG3M",
-                             "FTM", "OREB", "DREB", "STL", "BLK", "TOV", "PF", "PLUS_MINUS"]
+                show_cols = [
+                    "PLAYER_NAME",
+                    "START_POSITION",
+                    "MIN",
+                    "PTS",
+                    "REB",
+                    "AST",
+                    "PRA",
+                    "FG2M",
+                    "FG3M",
+                    "FTM",
+                    "OREB",
+                    "DREB",
+                    "STL",
+                    "BLK",
+                    "TOV",
+                    "PF",
+                    "PLUS_MINUS",
+                ]
                 bx = _ensure_cols(bx, show_cols)[show_cols].copy()
 
                 st.dataframe(
@@ -1131,6 +1198,7 @@ def team_tab():
 
     st.divider()
 
+    # ------------------ Minutes Rotation (unchanged from your working version) ------------------
     st.subheader("Minutes Rotation (Season vs Recent + Last 5 Games)")
     last_n_3 = 3
     last_n_10 = 10
@@ -1165,8 +1233,6 @@ def team_tab():
     else:
         rot["MIN_last10"] = np.nan
 
-    # Keep your original behavior: last 5 games MIN extraction (this does use boxscore calls).
-    # If you want, we can later switch this to read from the disk-cached boxscore df instead.
     last5_cols = []
     if glog is not None and not glog.empty and "GAME_ID" in glog.columns:
         last5 = glog.head(5).copy()
@@ -1178,13 +1244,19 @@ def team_tab():
             colname = f"MIN_{label}"
             last5_cols.append(colname)
 
-            # Instead of live scraping here, use the disk-cached team boxscore dataset if available:
-            bx_all = read_team_boxscores(team_id, season)
-            if bx_all is None or bx_all.empty:
+            # NOTE: this still does live calls for last-5 mins; you can disk-cache this too later if desired.
+            try:
+                frames = _retry_api(boxscoretraditionalv2.BoxScoreTraditionalV2, dict(game_id=str(game_id)))
+                bx = frames[0] if frames else pd.DataFrame()
+            except Exception:
+                bx = pd.DataFrame()
+
+            if bx is None or bx.empty or "PLAYER_ID" not in bx.columns:
                 rot[colname] = np.nan
                 continue
-            bx = bx_all[bx_all["GAME_ID"].astype(str) == str(game_id)].copy()
-            if bx.empty or "PLAYER_ID" not in bx.columns:
+
+            bx = bx[bx.get("TEAM_ID", -1) == int(team_id)].copy()
+            if bx.empty:
                 rot[colname] = np.nan
                 continue
 
@@ -1262,7 +1334,7 @@ def team_tab():
 
 
 # =====================================================================
-# PLAYER TAB
+# PLAYER TAB (unchanged)
 # =====================================================================
 def player_tab():
     st.title("NBA Player")
@@ -1438,10 +1510,10 @@ def player_tab():
             return pd.Series(dtype="float")
         if "PLAYER_ID" not in df.columns:
             return pd.Series(dtype="float")
-        row2 = df[df["PLAYER_ID"] == player_id]
-        if row2.empty:
+        row = df[df["PLAYER_ID"] == player_id]
+        if row.empty:
             return pd.Series(dtype="float")
-        return row2.iloc[0]
+        return row.iloc[0]
 
     def prev_season(season_str: str) -> Optional[str]:
         if season_str not in SEASONS:
@@ -1460,25 +1532,25 @@ def player_tab():
 
     car = get_career_summary(player_id)
 
-    def extract_comp(rowx: pd.Series, label: str) -> Dict[str, float]:
-        if rowx is None or rowx.empty:
+    def extract_comp(row: pd.Series, label: str) -> Dict[str, float]:
+        if row is None or row.empty:
             return {"WINDOW": label}
         for c in ["MIN", "PTS", "REB", "AST", "FGM", "FG3M", "OREB", "DREB"]:
-            if c not in rowx.index:
-                rowx[c] = np.nan
+            if c not in row.index:
+                row[c] = np.nan
         out = {
             "WINDOW": label,
-            "MIN": float(pd.to_numeric(rowx.get("MIN", np.nan), errors="coerce")) if pd.notna(rowx.get("MIN", np.nan)) else np.nan,
-            "PTS": float(pd.to_numeric(rowx.get("PTS", np.nan), errors="coerce")) if pd.notna(rowx.get("PTS", np.nan)) else np.nan,
-            "REB": float(pd.to_numeric(rowx.get("REB", np.nan), errors="coerce")) if pd.notna(rowx.get("REB", np.nan)) else np.nan,
-            "AST": float(pd.to_numeric(rowx.get("AST", np.nan), errors="coerce")) if pd.notna(rowx.get("AST", np.nan)) else np.nan,
-            "FG3M": float(pd.to_numeric(rowx.get("FG3M", np.nan), errors="coerce")) if pd.notna(rowx.get("FG3M", np.nan)) else np.nan,
-            "OREB": float(pd.to_numeric(rowx.get("OREB", np.nan), errors="coerce")) if pd.notna(rowx.get("OREB", np.nan)) else np.nan,
-            "DREB": float(pd.to_numeric(rowx.get("DREB", np.nan), errors="coerce")) if pd.notna(rowx.get("DREB", np.nan)) else np.nan,
+            "MIN": float(pd.to_numeric(row.get("MIN", np.nan), errors="coerce")) if pd.notna(row.get("MIN", np.nan)) else np.nan,
+            "PTS": float(pd.to_numeric(row.get("PTS", np.nan), errors="coerce")) if pd.notna(row.get("PTS", np.nan)) else np.nan,
+            "REB": float(pd.to_numeric(row.get("REB", np.nan), errors="coerce")) if pd.notna(row.get("REB", np.nan)) else np.nan,
+            "AST": float(pd.to_numeric(row.get("AST", np.nan), errors="coerce")) if pd.notna(row.get("AST", np.nan)) else np.nan,
+            "FG3M": float(pd.to_numeric(row.get("FG3M", np.nan), errors="coerce")) if pd.notna(row.get("FG3M", np.nan)) else np.nan,
+            "OREB": float(pd.to_numeric(row.get("OREB", np.nan), errors="coerce")) if pd.notna(row.get("OREB", np.nan)) else np.nan,
+            "DREB": float(pd.to_numeric(row.get("DREB", np.nan), errors="coerce")) if pd.notna(row.get("DREB", np.nan)) else np.nan,
         }
         out["PRA"] = (out.get("PTS", np.nan) + out.get("REB", np.nan) + out.get("AST", np.nan)) if pd.notna(out.get("PTS", np.nan)) else np.nan
-        fgm = pd.to_numeric(rowx.get("FGM", np.nan), errors="coerce")
-        fg3m = pd.to_numeric(rowx.get("FG3M", np.nan), errors="coerce")
+        fgm = pd.to_numeric(row.get("FGM", np.nan), errors="coerce")
+        fg3m = pd.to_numeric(row.get("FG3M", np.nan), errors="coerce")
         out["FG2M"] = float((fgm - fg3m)) if pd.notna(fgm) and pd.notna(fg3m) else np.nan
         return out
 
