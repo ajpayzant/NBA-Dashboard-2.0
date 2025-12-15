@@ -80,28 +80,38 @@ def get_or_refresh(
 ) -> CacheResult:
     """
     Load from parquet if exists and not stale; otherwise fetch and store.
-    normalize_fn is applied both on read and fetch to prevent dtype drift.
+
+    Critical safety:
+      - If the fresh fetch returns EMPTY, do NOT overwrite a non-empty cached file.
+        (This prevents transient NBA API throttles from "poisoning" cache.)
+      - Also avoids writing empty parquet files whenever possible.
     """
     df = None if force_refresh else read_parquet(key)
-    if df is not None and normalize_fn is not None:
-        df = normalize_fn(df)
 
+    if df is not None and normalize_fn is not None:
+        try:
+            df = normalize_fn(df)
+        except Exception:
+            pass
 
     if force_refresh or df is None or is_stale(key, ttl_seconds):
         fresh = fetch_fn()
         if normalize_fn is not None:
-            fresh = normalize_fn(fresh)
+            try:
+                fresh = normalize_fn(fresh)
+            except Exception:
+                pass
 
-        # SAFETY: don't overwrite a non-empty cached df with an empty fetch
-        # (common if NBA endpoint throttles or transiently fails)
+        # SAFETY: don't overwrite good cache with empty fetch
         if fresh is None or (hasattr(fresh, "empty") and fresh.empty):
+            # If we have a prior non-empty df, keep it
             if df is not None and hasattr(df, "empty") and not df.empty:
                 return CacheResult(df=df, from_cache=True, refreshed=False)
-            # If both are empty, just return empty (and avoid writing empty files)
+
+            # If both are empty, return empty but don't write empties
             return CacheResult(df=fresh if fresh is not None else pd.DataFrame(), from_cache=False, refreshed=True)
 
         write_parquet(key, fresh)
         return CacheResult(df=fresh, from_cache=False, refreshed=True)
-
 
     return CacheResult(df=df, from_cache=True, refreshed=False)
