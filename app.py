@@ -1,4 +1,8 @@
 # app.py — NBA League / Team / Player Dashboard (Streamlit)
+# Updated: Team Box Scores now read from preloaded on-disk parquet cache (no live throttling).
+
+import time
+import random
 import re
 import datetime as dt
 from typing import Dict, List, Optional, Tuple
@@ -8,33 +12,62 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 
-from src.cache_store import get_or_refresh
-from src.loaders import (
-    get_teams_static as _teams_static,
-    fetch_daily_scoreboard,
-    fetch_league_players_index,
-    fetch_player_logs,
-    fetch_common_player_info,
-    fetch_league_standings,
-    fetch_league_team_stats,
-    fetch_league_players_stats,
-    fetch_team_gamelog,
-    fetch_game_team_boxscore,
-    fetch_career_summary,
+from nba_api.stats.static import teams as static_teams
+from nba_api.stats.endpoints import (
+    scoreboardv2,
+    leaguedashteamstats,
+    LeagueDashPlayerStats,
+    playergamelog,
+    commonplayerinfo,
+    leaguestandingsv3,
+    teamgamelog,
+    boxscoretraditionalv2,
+    playercareerstats,
 )
+
+# NEW: disk cache reader for preloaded boxscores
+from src.cache_store import read_boxscores
 
 # ----------------------- Streamlit Setup -----------------------
 st.set_page_config(page_title="NBA Dashboard", layout="wide")
 
 # ----------------------- Config -----------------------
 CACHE_HOURS = 8
-TEAM_CTX_TTL_SECONDS = 300  # "fresh-ish" context items
+TEAM_CTX_TTL_SECONDS = 300
 
-TTL_LEAGUE = CACHE_HOURS * 3600
-TTL_TEAM_CTX = TEAM_CTX_TTL_SECONDS
-TTL_PLAYER = CACHE_HOURS * 3600
+REQUEST_TIMEOUT = 60
+MAX_RETRIES = 6
+BASE_SLEEP = 1.25
 
-_punct_re = re.compile(r"[^\w]")
+MIN_SECONDS_BETWEEN_CALLS = 1.0
+
+if "last_api_call_ts" not in st.session_state:
+    st.session_state["last_api_call_ts"] = 0.0
+
+
+def _rate_limit_pause(min_gap: float = MIN_SECONDS_BETWEEN_CALLS) -> None:
+    now = time.time()
+    last = float(st.session_state.get("last_api_call_ts", 0.0))
+    gap = now - last
+    if gap < min_gap:
+        time.sleep(min_gap - gap)
+    st.session_state["last_api_call_ts"] = time.time()
+
+
+def _retry_api(endpoint_cls, kwargs: dict, timeout: int = REQUEST_TIMEOUT) -> List[pd.DataFrame]:
+    last_err = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            _rate_limit_pause()
+            obj = endpoint_cls(timeout=timeout, **kwargs)
+            return obj.get_data_frames()
+        except Exception as e:
+            last_err = e
+            sleep_s = BASE_SLEEP * (2 ** (attempt - 1))
+            sleep_s = min(40.0, sleep_s)
+            sleep_s = sleep_s * (0.85 + 0.30 * random.random())
+            time.sleep(sleep_s)
+    raise last_err
 
 
 # ----------------------- Helpers -----------------------
@@ -43,7 +76,7 @@ def _season_labels(start=2015, end=None) -> List[str]:
         end = dt.datetime.now(dt.UTC).year
 
     def lab(y):
-        return f"{y}-{str((y+1) % 100).zfill(2)}"
+        return f"{y}-{str((y + 1) % 100).zfill(2)}"
 
     return [lab(y) for y in range(end, start - 1, -1)]
 
@@ -82,6 +115,9 @@ def _fmt1(v) -> str:
         return f"{float(v):.1f}"
     except Exception:
         return "—"
+
+
+_punct_re = re.compile(r"[^\w]")
 
 
 def parse_opp_from_matchup(matchup_str: str) -> Optional[str]:
@@ -133,7 +169,7 @@ def _rank_tile(col, label, value, rank, total=30, pct=False, decimals=1):
 
     if pct:
         try:
-            val_txt = f"{float(value)*100:.{decimals}f}%" if pd.notna(value) else "—"
+            val_txt = f"{float(value) * 100:.{decimals}f}%" if pd.notna(value) else "—"
         except Exception:
             val_txt = "—"
     else:
@@ -154,137 +190,407 @@ def _rank_tile(col, label, value, rank, total=30, pct=False, decimals=1):
     )
 
 
-# ----------------------- Disk cache wrappers -----------------------
-def teams_static_cached(force_refresh: bool = False) -> pd.DataFrame:
-    return get_or_refresh(
-        key="teams_static",
-        ttl_seconds=TTL_LEAGUE,
-        fetch_fn=lambda: _teams_static(),
-        force_refresh=force_refresh,
-    ).df
+# ----------------------- Static team maps -----------------------
+@st.cache_data(ttl=CACHE_HOURS * 3600, show_spinner=False)
+def get_teams_static() -> pd.DataFrame:
+    t = pd.DataFrame(static_teams.get_teams())
+    t = t.rename(columns={"id": "TEAM_ID", "full_name": "TEAM_NAME", "abbreviation": "TEAM_ABBREVIATION"})
+    t["TEAM_ID"] = pd.to_numeric(t["TEAM_ID"], errors="coerce").astype("Int64")
+    return t[["TEAM_ID", "TEAM_NAME", "TEAM_ABBREVIATION"]].dropna().reset_index(drop=True)
 
 
-def daily_scoreboard_cached(game_date: dt.date, force_refresh: bool = False) -> pd.DataFrame:
-    return get_or_refresh(
-        key=f"scoreboard__{game_date.isoformat()}",
-        ttl_seconds=TTL_TEAM_CTX,
-        fetch_fn=lambda: fetch_daily_scoreboard(game_date),
-        force_refresh=force_refresh,
-    ).df
+# ----------------------- Data fetchers -----------------------
+@st.cache_data(ttl=CACHE_HOURS * 3600, show_spinner=False)
+def get_league_players_index(season: str) -> pd.DataFrame:
+    try:
+        frames = _retry_api(
+            LeagueDashPlayerStats,
+            dict(
+                season=season,
+                season_type_all_star="Regular Season",
+                league_id_nullable="00",
+                per_mode_detailed="PerGame",
+                last_n_games=0,
+            ),
+        )
+        df = frames[0] if frames else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+    if df.empty:
+        return df
+
+    keep = ["PLAYER_ID", "PLAYER_NAME", "TEAM_ID", "TEAM_ABBREVIATION", "TEAM_NAME", "GP", "MIN"]
+    df = _ensure_cols(df, keep)[keep].copy()
+    df["PLAYER_ID"] = pd.to_numeric(df["PLAYER_ID"], errors="coerce").astype("Int64")
+    df["TEAM_ID"] = pd.to_numeric(df["TEAM_ID"], errors="coerce").astype("Int64")
+    df = df.dropna(subset=["PLAYER_ID"]).drop_duplicates(subset=["PLAYER_ID"])
+    return df.sort_values(["TEAM_NAME", "PLAYER_NAME"]).reset_index(drop=True)
 
 
-def get_schedule_range(start_date: dt.date, days: int, force_refresh: bool = False) -> pd.DataFrame:
+@st.cache_data(ttl=CACHE_HOURS * 3600, show_spinner=False)
+def get_player_logs(player_id: int, season: str) -> pd.DataFrame:
+    try:
+        frames = _retry_api(
+            playergamelog.PlayerGameLog,
+            dict(
+                player_id=int(player_id),
+                season=season,
+                season_type_all_star="Regular Season",
+                league_id_nullable="00",
+            ),
+        )
+        df = frames[0] if frames else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+    if df.empty:
+        return df
+
+    if "GAME_DATE" in df.columns:
+        df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"], errors="coerce")
+    return df.sort_values("GAME_DATE", ascending=False).reset_index(drop=True)
+
+
+@st.cache_data(ttl=CACHE_HOURS * 3600, show_spinner=False)
+def get_common_player_info(player_id: int) -> pd.DataFrame:
+    try:
+        frames = _retry_api(commonplayerinfo.CommonPlayerInfo, {"player_id": int(player_id)})
+        return frames[0] if frames else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=TEAM_CTX_TTL_SECONDS, show_spinner=False)
+def get_daily_scoreboard(game_date: dt.date) -> pd.DataFrame:
+    date_str = game_date.strftime("%m/%d/%Y")
+    try:
+        frames = _retry_api(scoreboardv2.ScoreboardV2, {"game_date": date_str, "league_id": "00"})
+    except Exception:
+        return pd.DataFrame()
+
+    if not frames or len(frames) < 2:
+        return pd.DataFrame()
+
+    game_header = frames[0].copy()
+    line_score = frames[1].copy()
+
+    if game_header is None or game_header.empty:
+        return pd.DataFrame()
+
+    game_header = _ensure_cols(
+        game_header,
+        ["GAME_ID", "GAME_STATUS_ID", "GAME_STATUS_TEXT", "HOME_TEAM_ID", "VISITOR_TEAM_ID"],
+    )
+    line_score = _ensure_cols(line_score, ["GAME_ID", "TEAM_ID", "PTS"])
+
+    tstatic = get_teams_static()
+    id2abbr = dict(zip(tstatic["TEAM_ID"].astype(int), tstatic["TEAM_ABBREVIATION"].astype(str)))
+
+    line_score["TEAM_ID"] = pd.to_numeric(line_score["TEAM_ID"], errors="coerce")
+    line_score["PTS"] = pd.to_numeric(line_score["PTS"], errors="coerce")
+    pts_map = (
+        line_score.dropna(subset=["GAME_ID", "TEAM_ID"])
+        .assign(TEAM_ID=lambda d: d["TEAM_ID"].astype(int))
+        .set_index(["GAME_ID", "TEAM_ID"])["PTS"]
+        .to_dict()
+    )
+
+    out_rows = []
+    for r in game_header.itertuples(index=False):
+        gid = str(getattr(r, "GAME_ID"))
+        home_id = pd.to_numeric(getattr(r, "HOME_TEAM_ID", np.nan), errors="coerce")
+        away_id = pd.to_numeric(getattr(r, "VISITOR_TEAM_ID", np.nan), errors="coerce")
+        status_id = pd.to_numeric(getattr(r, "GAME_STATUS_ID", np.nan), errors="coerce")
+        status_text = str(getattr(r, "GAME_STATUS_TEXT", "")).strip()
+
+        if pd.isna(home_id) or pd.isna(away_id):
+            continue
+        home_id = int(home_id)
+        away_id = int(away_id)
+
+        home_abbr = id2abbr.get(home_id, str(home_id))
+        away_abbr = id2abbr.get(away_id, str(away_id))
+        matchup = f"{away_abbr} @ {home_abbr}"
+
+        home_pts = pts_map.get((gid, home_id), np.nan)
+        away_pts = pts_map.get((gid, away_id), np.nan)
+
+        status_display = status_text if status_text else "—"
+        if pd.notna(status_id) and int(status_id) == 3 and pd.notna(home_pts) and pd.notna(away_pts):
+            status_display = f"Final: {int(away_pts)}–{int(home_pts)}"
+        elif isinstance(status_text, str) and status_text.lower().startswith("final") and pd.notna(home_pts) and pd.notna(away_pts):
+            status_display = f"{status_text}: {int(away_pts)}–{int(home_pts)}"
+
+        out_rows.append(
+            {
+                "DATE": game_date,
+                "GAME_ID": gid,
+                "MATCHUP": matchup,
+                "STATUS_TEXT": status_text,
+                "STATUS": status_display,
+                "AWAY_PTS": away_pts,
+                "HOME_PTS": home_pts,
+            }
+        )
+
+    if not out_rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(out_rows)
+    out = out.sort_values(["DATE", "MATCHUP"]).reset_index(drop=True)
+    return out
+
+
+@st.cache_data(ttl=TEAM_CTX_TTL_SECONDS, show_spinner=False)
+def get_schedule_range(start_date: dt.date, days: int) -> pd.DataFrame:
     all_days = []
     for i in range(days):
         d = start_date + dt.timedelta(days=i)
-        df = daily_scoreboard_cached(d, force_refresh=force_refresh)
+        df = get_daily_scoreboard(d)
         if df is None or df.empty:
             continue
         all_days.append(df[["DATE", "MATCHUP", "STATUS"]].copy())
     if not all_days:
         return pd.DataFrame()
     sched = pd.concat(all_days, ignore_index=True)
-    return sched.sort_values(["DATE", "MATCHUP"]).reset_index(drop=True)
+    sched = sched.sort_values(["DATE", "MATCHUP"]).reset_index(drop=True)
+    return sched
 
 
-def league_players_index_cached(season: str, force_refresh: bool = False) -> pd.DataFrame:
-    return get_or_refresh(
-        key=f"players_index__{season}",
-        ttl_seconds=TTL_LEAGUE,
-        fetch_fn=lambda: fetch_league_players_index(season),
-        force_refresh=force_refresh,
-    ).df
+@st.cache_data(ttl=CACHE_HOURS * 3600, show_spinner=False)
+def fetch_league_standings(season: str) -> pd.DataFrame:
+    try:
+        frames = _retry_api(
+            leaguestandingsv3.LeagueStandingsV3,
+            dict(
+                season=season,
+                season_type="Regular Season",
+            ),
+        )
+        df = frames[0] if frames else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+    if df.empty:
+        return df
+
+    wanted = [
+        "TeamID",
+        "TeamName",
+        "TeamCity",
+        "TeamAbbreviation",
+        "Conference",
+        "WINS",
+        "LOSSES",
+        "WinPCT",
+    ]
+    df = _ensure_cols(df, wanted)
+
+    out = pd.DataFrame(
+        {
+            "TEAM_ID": pd.to_numeric(df["TeamID"], errors="coerce"),
+            "TEAM": (df["TeamCity"].astype("string").fillna("") + " " + df["TeamName"].astype("string").fillna("")).str.strip(),
+            "CONF": df["Conference"].astype("string"),
+            "W": pd.to_numeric(df["WINS"], errors="coerce"),
+            "L": pd.to_numeric(df["LOSSES"], errors="coerce"),
+            "W%": pd.to_numeric(df["WinPCT"], errors="coerce"),
+        }
+    )
+    out["TEAM_ID"] = out["TEAM_ID"].astype("Int64")
+    out = out.dropna(subset=["TEAM_ID"]).drop_duplicates(subset=["TEAM_ID"]).reset_index(drop=True)
+    return out
 
 
-def league_standings_cached(season: str, force_refresh: bool = False) -> pd.DataFrame:
-    return get_or_refresh(
-        key=f"standings__{season}",
-        ttl_seconds=TTL_LEAGUE,
-        fetch_fn=lambda: fetch_league_standings(season),
-        force_refresh=force_refresh,
-    ).df
+@st.cache_data(ttl=CACHE_HOURS * 3600, show_spinner=False)
+def fetch_league_team_stats(season: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    def _get(measure: str, per_mode: str) -> pd.DataFrame:
+        try:
+            frames = _retry_api(
+                leaguedashteamstats.LeagueDashTeamStats,
+                dict(
+                    season=season,
+                    season_type_all_star="Regular Season",
+                    league_id_nullable="00",
+                    measure_type_detailed_defense=measure,
+                    per_mode_detailed=per_mode,
+                ),
+            )
+            df = frames[0] if frames else pd.DataFrame()
+        except Exception:
+            return pd.DataFrame()
 
+        if df.empty:
+            return df
 
-def league_team_stats_cached(season: str, force_refresh: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    base = get_or_refresh(
-        key=f"teamstats_base__{season}",
-        ttl_seconds=TTL_LEAGUE,
-        fetch_fn=lambda: fetch_league_team_stats(season)[0],
-        force_refresh=force_refresh,
-    ).df
-    adv = get_or_refresh(
-        key=f"teamstats_adv__{season}",
-        ttl_seconds=TTL_LEAGUE,
-        fetch_fn=lambda: fetch_league_team_stats(season)[1],
-        force_refresh=force_refresh,
-    ).df
-    opp = get_or_refresh(
-        key=f"teamstats_opp__{season}",
-        ttl_seconds=TTL_LEAGUE,
-        fetch_fn=lambda: fetch_league_team_stats(season)[2],
-        force_refresh=force_refresh,
-    ).df
+        if "TEAM_ID" in df.columns:
+            df = df[df["TEAM_ID"].astype(str).str.startswith("161061")].copy()
+        return df.reset_index(drop=True)
+
+    base = _get("Base", "PerGame")
+    adv = _get("Advanced", "PerGame")
+    opp = _get("Opponent", "PerGame")
     return base, adv, opp
 
 
-def league_players_stats_cached(season: str, per_mode: str, last_n: int, force_refresh: bool = False) -> pd.DataFrame:
-    return get_or_refresh(
-        key=f"playerstats__{season}__{per_mode}__last{int(last_n)}",
-        ttl_seconds=TTL_LEAGUE,
-        fetch_fn=lambda: fetch_league_players_stats(season, per_mode=per_mode, last_n_games=last_n),
-        force_refresh=force_refresh,
-    ).df
+@st.cache_data(ttl=CACHE_HOURS * 3600, show_spinner=False)
+def fetch_league_players_stats(season: str, per_mode: str, last_n_games: int) -> pd.DataFrame:
+    try:
+        frames = _retry_api(
+            LeagueDashPlayerStats,
+            dict(
+                season=season,
+                season_type_all_star="Regular Season",
+                league_id_nullable="00",
+                per_mode_detailed=per_mode,
+                last_n_games=int(last_n_games),
+            ),
+        )
+        df = frames[0] if frames else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+    if df.empty:
+        return df
+
+    if "TEAM_ID" in df.columns:
+        df = df[df["TEAM_ID"].astype(str).str.startswith("161061")].copy()
+    return df.reset_index(drop=True)
 
 
-def player_logs_cached(player_id: int, season: str, force_refresh: bool = False) -> pd.DataFrame:
-    return get_or_refresh(
-        key=f"playerlogs__{season}__{int(player_id)}",
-        ttl_seconds=TTL_PLAYER,
-        fetch_fn=lambda: fetch_player_logs(player_id, season),
-        force_refresh=force_refresh,
-    ).df
+@st.cache_data(ttl=TEAM_CTX_TTL_SECONDS, show_spinner=False)
+def get_team_gamelog(team_id: int, season: str) -> pd.DataFrame:
+    try:
+        frames = _retry_api(
+            teamgamelog.TeamGameLog,
+            dict(
+                team_id=int(team_id),
+                season=season,
+                season_type_all_star="Regular Season",
+                league_id_nullable="00",
+            ),
+        )
+        df = frames[0] if frames else pd.DataFrame()
+    except Exception:
+        df = pd.DataFrame()
+
+    if df is not None and not df.empty and "GAME_ID" in df.columns:
+        if "GAME_DATE" in df.columns:
+            df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"], errors="coerce")
+        return df.sort_values("GAME_DATE", ascending=False).reset_index(drop=True)
+
+    # fallback approach kept as-is (rarely needed)
+    tstatic = get_teams_static()
+    id2abbr = dict(zip(tstatic["TEAM_ID"].astype(int), tstatic["TEAM_ABBREVIATION"].astype(str)))
+    my_abbr = id2abbr.get(int(team_id), "")
+
+    start = dt.date.today() - dt.timedelta(days=200)
+    rows = []
+    for i in range(200):
+        d = start + dt.timedelta(days=i)
+        day = get_daily_scoreboard(d)
+        if day is None or day.empty:
+            continue
+
+        for r in day.itertuples(index=False):
+            matchup = getattr(r, "MATCHUP", "")
+            gid = getattr(r, "GAME_ID", "")
+            away_pts = getattr(r, "AWAY_PTS", np.nan)
+            home_pts = getattr(r, "HOME_PTS", np.nan)
+
+            if not isinstance(matchup, str) or "@" not in matchup:
+                continue
+            if my_abbr and (my_abbr not in matchup):
+                continue
+
+            away_abbr = matchup.split("@")[0].strip()
+            home_abbr = matchup.split("@")[1].strip()
+
+            wl = ""
+            if pd.notna(away_pts) and pd.notna(home_pts):
+                if my_abbr == away_abbr:
+                    wl = "W" if float(away_pts) > float(home_pts) else "L"
+                elif my_abbr == home_abbr:
+                    wl = "W" if float(home_pts) > float(away_pts) else "L"
+
+            rows.append(
+                {
+                    "GAME_ID": str(gid),
+                    "GAME_DATE": pd.to_datetime(d),
+                    "MATCHUP": matchup,
+                    "WL": wl,
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(rows).drop_duplicates(subset=["GAME_ID"]).sort_values("GAME_DATE", ascending=False).reset_index(drop=True)
+    return out
 
 
-def player_info_cached(player_id: int, force_refresh: bool = False) -> pd.DataFrame:
-    return get_or_refresh(
-        key=f"playerinfo__{int(player_id)}",
-        ttl_seconds=TTL_LEAGUE,
-        fetch_fn=lambda: fetch_common_player_info(player_id),
-        force_refresh=force_refresh,
-    ).df
+@st.cache_data(ttl=CACHE_HOURS * 3600, show_spinner=False)
+def get_career_summary(player_id: int) -> pd.DataFrame:
+    try:
+        frames = _retry_api(playercareerstats.PlayerCareerStats, dict(player_id=int(player_id)))
+        season_totals = frames[0] if frames and len(frames) > 0 else pd.DataFrame()
+        career_totals = frames[1] if frames and len(frames) > 1 else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+    use = None
+    if career_totals is not None and not career_totals.empty:
+        use = career_totals.copy()
+    elif season_totals is not None and not season_totals.empty:
+        use = season_totals.copy()
+        num_cols = use.select_dtypes(include=[np.number]).columns
+        use = pd.DataFrame([use[num_cols].sum(numeric_only=True)])
+    else:
+        return pd.DataFrame()
+
+    for c in ["GP", "MIN", "PTS", "REB", "AST", "FGM", "FG3M", "OREB", "DREB"]:
+        if c not in use.columns:
+            use[c] = np.nan
+        use[c] = pd.to_numeric(use[c], errors="coerce")
+
+    gp = float(use["GP"].iloc[0]) if pd.notna(use["GP"].iloc[0]) else np.nan
+    mins = float(use["MIN"].iloc[0]) if pd.notna(use["MIN"].iloc[0]) else np.nan
+
+    def per_game(col):
+        v = float(use[col].iloc[0]) if col in use.columns and pd.notna(use[col].iloc[0]) else np.nan
+        return v / gp if gp and gp > 0 else np.nan
+
+    def per36(col):
+        v = float(use[col].iloc[0]) if col in use.columns and pd.notna(use[col].iloc[0]) else np.nan
+        return (v / mins) * 36.0 if mins and mins > 0 else np.nan
+
+    out = pd.DataFrame(
+        {
+            "GP": [gp],
+            "MIN": [mins],
+            "PTS_PG": [per_game("PTS")],
+            "REB_PG": [per_game("REB")],
+            "AST_PG": [per_game("AST")],
+            "FGM_PG": [per_game("FGM")],
+            "FG3M_PG": [per_game("FG3M")],
+            "OREB_PG": [per_game("OREB")],
+            "DREB_PG": [per_game("DREB")],
+            "PTS_36": [per36("PTS")],
+            "REB_36": [per36("REB")],
+            "AST_36": [per36("AST")],
+            "FGM_36": [per36("FGM")],
+            "FG3M_36": [per36("FG3M")],
+            "OREB_36": [per36("OREB")],
+            "DREB_36": [per36("DREB")],
+        }
+    )
+    return out
 
 
-def career_summary_cached(player_id: int, force_refresh: bool = False) -> pd.DataFrame:
-    return get_or_refresh(
-        key=f"career__{int(player_id)}",
-        ttl_seconds=TTL_LEAGUE,
-        fetch_fn=lambda: fetch_career_summary(player_id),
-        force_refresh=force_refresh,
-    ).df
-
-
-def team_gamelog_cached(team_id: int, season: str, force_refresh: bool = False) -> pd.DataFrame:
-    return get_or_refresh(
-        key=f"teamgamelog__{season}__{int(team_id)}",
-        ttl_seconds=TTL_TEAM_CTX,
-        fetch_fn=lambda: fetch_team_gamelog(team_id, season),
-        force_refresh=force_refresh,
-    ).df
-
-
-def team_boxscore_cached(game_id: str, team_id: int, force_refresh: bool = False) -> pd.DataFrame:
-    return get_or_refresh(
-        key=f"boxscore__{str(game_id)}__team{int(team_id)}",
-        ttl_seconds=TTL_TEAM_CTX,
-        fetch_fn=lambda: fetch_game_team_boxscore(game_id, team_id),
-        force_refresh=force_refresh,
-    ).df
-
-
-# ----------------------- League Tables -----------------------
-def build_team_standings_table(season: str, force_refresh: bool = False) -> pd.DataFrame:
-    standings = league_standings_cached(season, force_refresh=force_refresh)
-    base, adv, _opp = league_team_stats_cached(season, force_refresh=force_refresh)
+@st.cache_data(ttl=CACHE_HOURS * 3600, show_spinner=False)
+def build_team_standings_table(season: str) -> pd.DataFrame:
+    standings = fetch_league_standings(season)
+    base, adv, _opp = fetch_league_team_stats(season)
 
     if standings.empty and base.empty and adv.empty:
         return pd.DataFrame()
@@ -313,7 +619,7 @@ def build_team_standings_table(season: str, force_refresh: bool = False) -> pd.D
     merged = merged.merge(base, on="TEAM_ID", how="left")
     merged = merged.merge(adv, on="TEAM_ID", how="left")
 
-    tstatic = teams_static_cached(force_refresh=False)
+    tstatic = get_teams_static()
     merged = merged.merge(tstatic[["TEAM_ID", "TEAM_NAME"]], on="TEAM_ID", how="left", suffixes=("", "_STATIC"))
     merged["TEAM"] = merged["TEAM"].fillna(merged["TEAM_NAME"])
     merged = merged.drop(columns=["TEAM_NAME", "TEAM_NAME_STATIC"], errors="ignore")
@@ -359,19 +665,25 @@ def build_team_standings_table(season: str, force_refresh: bool = False) -> pd.D
             "PLUS_MINUS": "+/-",
         }
     )
+
     return merged
 
 
-def build_opponent_allowed_table(season: str, force_refresh: bool = False) -> pd.DataFrame:
-    standings = league_standings_cached(season, force_refresh=force_refresh)
-    _base, _adv, opp = league_team_stats_cached(season, force_refresh=force_refresh)
+@st.cache_data(ttl=CACHE_HOURS * 3600, show_spinner=False)
+def build_opponent_allowed_table(season: str) -> pd.DataFrame:
+    standings = fetch_league_standings(season)
+    _base, _adv, opp = fetch_league_team_stats(season)
 
     if standings.empty and opp.empty:
         return pd.DataFrame()
-    if opp.empty or "TEAM_ID" not in opp.columns:
+
+    if opp.empty:
         return pd.DataFrame()
 
     opp = opp.copy()
+    if "TEAM_ID" not in opp.columns:
+        return pd.DataFrame()
+
     opp["TEAM_ID"] = pd.to_numeric(opp["TEAM_ID"], errors="coerce").astype("Int64")
 
     preferred = [
@@ -455,14 +767,16 @@ def league_tab():
     with bar3:
         days_ahead = st.selectbox("Days ahead", [3, 5, 7, 10, 14], index=2, key="lg_days_ahead")
     with bar4:
-        force_refresh = st.button("Hard refresh (league)", key="lg_force_refresh")
+        if st.button("Hard clear cache", key="lg_clear_cache"):
+            st.cache_data.clear()
+            st.success("Cache cleared.")
 
     tabA, tabB = st.tabs(["Teams", "Player Leaders"])
 
     with tabA:
         st.subheader("Schedule (Upcoming + Completed)")
         with st.spinner("Loading schedule..."):
-            sched = get_schedule_range(start_date, int(days_ahead), force_refresh=force_refresh)
+            sched = get_schedule_range(start_date, int(days_ahead))
 
         if sched.empty:
             st.info("No games found in this date range (or the API returned empty). Try a different start date.")
@@ -474,10 +788,10 @@ def league_tab():
         st.subheader("Standings + Team Stats")
         conf = st.radio("Conference filter", ["All", "East", "West"], horizontal=True, key="lg_conf_filter")
         with st.spinner("Loading standings & team stats..."):
-            team_tbl = build_team_standings_table(season, force_refresh=force_refresh)
+            team_tbl = build_team_standings_table(season)
 
         if team_tbl.empty:
-            st.error("Could not load standings/team stats. Try refreshing.")
+            st.error("Could not load standings/team stats. Try clearing cache.")
             return
 
         if conf != "All":
@@ -490,13 +804,17 @@ def league_tab():
         fmt.pop("W", None)
         fmt.pop("L", None)
 
-        st.dataframe(team_tbl.style.format(fmt), width="stretch", height=_auto_height(team_tbl, max_px=820))
+        st.dataframe(
+            team_tbl.style.format(fmt),
+            width="stretch",
+            height=_auto_height(team_tbl, max_px=820),
+        )
 
         st.divider()
 
         st.subheader("Opponent Allowed Metrics (Leaguewide)")
         with st.spinner("Loading opponent tables..."):
-            opp_tbl = build_opponent_allowed_table(season, force_refresh=force_refresh)
+            opp_tbl = build_opponent_allowed_table(season)
 
         if opp_tbl.empty:
             st.info("Opponent allowed metrics are not available for this season from the API.")
@@ -507,7 +825,11 @@ def league_tab():
             for col in ["W%", "Opp FG%", "Opp 3P%", "Opp FT%"]:
                 if col in fmt2:
                     fmt2[col] = "{:.3f}"
-            st.dataframe(opp_tbl.style.format(fmt2), width="stretch", height=_auto_height(opp_tbl, max_px=820))
+            st.dataframe(
+                opp_tbl.style.format(fmt2),
+                width="stretch",
+                height=_auto_height(opp_tbl, max_px=820),
+            )
 
     with tabB:
         st.subheader("Leaguewide Player Leaders")
@@ -524,10 +846,10 @@ def league_tab():
 
         last_n = 0 if window == "Season" else int(window.split()[-1])
         with st.spinner("Loading player stats..."):
-            pstats = league_players_stats_cached(season, per_mode=per_mode, last_n=int(last_n), force_refresh=force_refresh)
+            pstats = fetch_league_players_stats(season, per_mode=per_mode, last_n_games=last_n)
 
         if pstats.empty:
-            st.error("Could not load player stats. Try refreshing.")
+            st.error("Could not load player stats. Try clearing cache.")
             return
 
         if "GP" in pstats.columns and int(min_gp) > 0:
@@ -566,7 +888,7 @@ def team_tab():
     with t1:
         season = st.selectbox("Season", SEASONS, index=0, key="tm_season")
     with t2:
-        tdf = teams_static_cached()
+        tdf = get_teams_static()
         team_name = st.selectbox("Team", sorted(tdf["TEAM_NAME"].tolist()), key="tm_team")
         team_row = tdf[tdf["TEAM_NAME"] == team_name].iloc[0]
         team_id = int(team_row["TEAM_ID"])
@@ -577,10 +899,10 @@ def team_tab():
         roster_window = st.selectbox("Roster window", ["Season", "Last 5", "Last 10", "Last 15"], index=0, key="tm_roster_window")
 
     with st.spinner("Loading team stats..."):
-        base, adv, opp = league_team_stats_cached(season)
+        base, adv, opp = fetch_league_team_stats(season)
 
     if base.empty or adv.empty:
-        st.error("Could not load team stats. Try refreshing.")
+        st.error("Could not load team stats. Try clearing cache.")
         return
 
     base_cols = [
@@ -652,11 +974,8 @@ def team_tab():
         return
     tr = row.iloc[0]
 
-    # ----------------------- Team Gamelog (FIXED UI + refresh) -----------------------
-    refresh_gamelog = st.button("Refresh Team Game Log", key=f"tm_refresh_gamelog_{team_id}_{season}")
-
     with st.spinner("Loading team gamelog..."):
-        glog = team_gamelog_cached(team_id, season, force_refresh=refresh_gamelog)
+        glog = get_team_gamelog(team_id, season)
 
     season_record = "—"
     if pd.notna(tr.get("W")) and pd.notna(tr.get("L")):
@@ -688,53 +1007,179 @@ def team_tab():
 
     st.divider()
 
-    # ----------------------- Team Box Scores -----------------------
+    # -----------------------------------------------------------------
+    # TEAM BOX SCORES (UPDATED): disk-only, reads preloaded parquet
+    # -----------------------------------------------------------------
     st.subheader("Team Box Scores (Pick a Game)")
 
-    if glog is None or glog.empty:
-        st.info("No game log available for box score selection. Try 'Refresh Team Game Log'.")
+    if glog is None or glog.empty or "GAME_ID" not in glog.columns:
+        st.info("No game log available for box score selection.")
     else:
         glog2 = glog.copy()
-
-        # Back-compat normalization in case cached parquet has older casing
-        if "GAME_ID" not in glog2.columns and "Game_ID" in glog2.columns:
-            glog2 = glog2.rename(columns={"Game_ID": "GAME_ID"})
-        if "GAME_DATE" not in glog2.columns and "GameDate" in glog2.columns:
-            glog2 = glog2.rename(columns={"GameDate": "GAME_DATE"})
-
-        if "GAME_ID" not in glog2.columns:
-            st.info("Game log loaded, but GAME_ID is missing. Click 'Refresh Team Game Log'.")
-            return
-
-        glog2["GAME_DATE"] = pd.to_datetime(glog2.get("GAME_DATE", pd.NaT), errors="coerce")
+        glog2["GAME_DATE"] = pd.to_datetime(glog2["GAME_DATE"], errors="coerce")
         glog2["GAME_DATE_STR"] = glog2["GAME_DATE"].dt.strftime("%Y-%m-%d")
         glog2["LABEL"] = (
             glog2["GAME_DATE_STR"].astype("string")
             + " | "
-            + glog2.get("MATCHUP", "").astype("string")
+            + glog2["MATCHUP"].astype("string")
             + " | "
             + glog2.get("WL", "").astype("string")
         )
 
-        # Default to most recent played game
-        label_list = glog2["LABEL"].fillna("").tolist()
-        gsel = st.selectbox("Select game", label_list, index=0, key="tm_game_select")
-
+        gsel = st.selectbox("Select game", glog2["LABEL"].tolist(), index=0, key="tm_game_select")
         game_id = str(glog2[glog2["LABEL"] == gsel]["GAME_ID"].iloc[0])
 
-        refresh_box = st.button("Refresh Box Score", key=f"tm_refresh_box_{team_id}_{game_id}")
-        with st.spinner("Loading box score..."):
-            bx = team_boxscore_cached(game_id, team_id, force_refresh=refresh_box)
+        # Read preloaded team boxscores from disk (no throttling)
+        box_all = read_boxscores(team_id, season)
 
-        if bx.empty:
-            st.info("No box score returned for this game (API may be throttling). Try another game or refresh.")
+        if box_all.empty:
+            st.warning(
+                "Box scores are not preloaded yet for this team/season.\n\n"
+                "Run your preload script to populate data_cache (team_boxscores__{season}__{team_id}.parquet)."
+            )
         else:
-            keep = ["PLAYER_NAME", "START_POSITION", "MIN", "PTS", "REB", "AST", "FGM", "FGA", "FG3M", "FG3A", "FTM", "FTA", "OREB", "DREB", "STL", "BLK", "TO", "PF", "PLUS_MINUS"]
-            bx = _ensure_cols(bx, keep)[keep].copy()
-            bx = bx.rename(columns={"TO": "TOV"})
-            for c in bx.columns:
-                if c not in ("PLAYER_NAME", "START_POSITION", "MIN"):
-                    bx[c] = pd.to_numeric(bx[c], errors="coerce")
+            # Filter to selected game
+            bx = box_all[box_all["GAME_ID"].astype(str) == str(game_id)].copy()
+
+            if bx.empty:
+                st.info("No preloaded box score found for this game.")
+            else:
+                keep = [
+                    "PLAYER_NAME",
+                    "START_POSITION",
+                    "MIN",
+                    "PTS",
+                    "REB",
+                    "AST",
+                    "FGM",
+                    "FGA",
+                    "FG3M",
+                    "FG3A",
+                    "FTM",
+                    "FTA",
+                    "OREB",
+                    "DREB",
+                    "STL",
+                    "BLK",
+                    "TO",
+                    "PF",
+                    "PLUS_MINUS",
+                ]
+                bx = _ensure_cols(bx, keep)[keep].copy()
+                bx = bx.rename(columns={"TO": "TOV"})
+                for c in bx.columns:
+                    if c not in ("PLAYER_NAME", "START_POSITION", "MIN"):
+                        bx[c] = pd.to_numeric(bx[c], errors="coerce")
+
+                def parse_min(x):
+                    if pd.isna(x):
+                        return np.nan
+                    if isinstance(x, (int, float)):
+                        return float(x)
+                    s = str(x)
+                    if ":" in s:
+                        try:
+                            mm, ss = s.split(":")
+                            return float(mm) + float(ss) / 60.0
+                        except Exception:
+                            return np.nan
+                    try:
+                        return float(s)
+                    except Exception:
+                        return np.nan
+
+                bx["MIN"] = bx["MIN"].apply(parse_min)
+                bx["PRA"] = bx["PTS"].fillna(0) + bx["REB"].fillna(0) + bx["AST"].fillna(0)
+                bx["FG2M"] = (bx["FGM"].fillna(0) - bx["FG3M"].fillna(0)).clip(lower=0)
+
+                show_cols = [
+                    "PLAYER_NAME",
+                    "START_POSITION",
+                    "MIN",
+                    "PTS",
+                    "REB",
+                    "AST",
+                    "PRA",
+                    "FG2M",
+                    "FG3M",
+                    "FTM",
+                    "OREB",
+                    "DREB",
+                    "STL",
+                    "BLK",
+                    "TOV",
+                    "PF",
+                    "PLUS_MINUS",
+                ]
+                bx = _ensure_cols(bx, show_cols)[show_cols].copy()
+                st.dataframe(
+                    bx.style.format({c: "{:.1f}" for c in bx.select_dtypes(include=[np.number]).columns}),
+                    width="stretch",
+                    height=_auto_height(bx, max_px=760),
+                )
+
+    st.divider()
+
+    st.subheader("Minutes Rotation (Season vs Recent + Last 5 Games)")
+    last_n_3 = 3
+    last_n_10 = 10
+    last_n_user = 0 if roster_window == "Season" else int(roster_window.split()[-1])
+
+    with st.spinner("Loading roster snapshots..."):
+        season_roster_pg = fetch_league_players_stats(season, per_mode="PerGame", last_n_games=0)
+        last3_pg = fetch_league_players_stats(season, per_mode="PerGame", last_n_games=last_n_3)
+        last10_pg = fetch_league_players_stats(season, per_mode="PerGame", last_n_games=last_n_10)
+
+    if season_roster_pg.empty:
+        st.info("Roster data not available.")
+        return
+
+    season_team = season_roster_pg[season_roster_pg["TEAM_ID"] == team_id].copy()
+    last3_team = last3_pg[last3_pg["TEAM_ID"] == team_id].copy() if not last3_pg.empty else pd.DataFrame()
+    last10_team = last10_pg[last10_pg["TEAM_ID"] == team_id].copy() if not last10_pg.empty else pd.DataFrame()
+
+    roster_df = fetch_league_players_stats(season, per_mode=roster_per_mode, last_n_games=last_n_user)
+    roster_df = roster_df[roster_df["TEAM_ID"] == team_id].copy() if roster_df is not None and not roster_df.empty else pd.DataFrame()
+
+    rot = season_team[["PLAYER_ID", "PLAYER_NAME", "MIN"]].copy()
+    rot = rot.rename(columns={"MIN": "MIN_season"})
+    if not last3_team.empty:
+        tmp = last3_team[["PLAYER_ID", "MIN"]].copy().rename(columns={"MIN": "MIN_last3"})
+        rot = rot.merge(tmp, on="PLAYER_ID", how="left")
+    else:
+        rot["MIN_last3"] = np.nan
+    if not last10_team.empty:
+        tmp = last10_team[["PLAYER_ID", "MIN"]].copy().rename(columns={"MIN": "MIN_last10"})
+        rot = rot.merge(tmp, on="PLAYER_ID", how="left")
+    else:
+        rot["MIN_last10"] = np.nan
+
+    last5_cols = []
+    if glog is not None and not glog.empty and "GAME_ID" in glog.columns:
+        last5 = glog.head(5).copy()
+        last5 = last5.sort_values("GAME_DATE", ascending=False)
+
+        # UPDATED: use preloaded boxscores for last-5 minutes instead of live API
+        box_all = read_boxscores(team_id, season)
+
+        for i, r in enumerate(last5.itertuples(index=False), start=1):
+            game_id = str(getattr(r, "GAME_ID"))
+            gdate = getattr(r, "GAME_DATE")
+            label = gdate.strftime("%m/%d") if isinstance(gdate, pd.Timestamp) else f"Game {i}"
+            colname = f"MIN_{label}"
+            last5_cols.append(colname)
+
+            if box_all.empty:
+                rot[colname] = np.nan
+                continue
+
+            bx = box_all[box_all["GAME_ID"].astype(str) == game_id].copy()
+            if bx.empty or "PLAYER_ID" not in bx.columns:
+                rot[colname] = np.nan
+                continue
+
+            bx2 = bx[["PLAYER_ID", "MIN"]].copy()
+            bx2["PLAYER_ID"] = pd.to_numeric(bx2["PLAYER_ID"], errors="coerce").astype("Int64")
 
             def parse_min(x):
                 if pd.isna(x):
@@ -753,64 +1198,28 @@ def team_tab():
                 except Exception:
                     return np.nan
 
-            bx["MIN"] = bx["MIN"].apply(parse_min)
-            bx["PRA"] = bx["PTS"].fillna(0) + bx["REB"].fillna(0) + bx["AST"].fillna(0)
-            bx["FG2M"] = (bx["FGM"].fillna(0) - bx["FG3M"].fillna(0)).clip(lower=0)
+            bx2["MIN"] = bx2["MIN"].apply(parse_min)
+            bx2 = bx2.rename(columns={"MIN": colname})
+            rot = rot.merge(bx2, on="PLAYER_ID", how="left")
 
-            show_cols = ["PLAYER_NAME", "START_POSITION", "MIN", "PTS", "REB", "AST", "PRA", "FG2M", "FG3M", "FTM", "OREB", "DREB", "STL", "BLK", "TOV", "PF", "PLUS_MINUS"]
-            bx = _ensure_cols(bx, show_cols)[show_cols].copy()
-            st.dataframe(
-                bx.style.format({c: "{:.1f}" for c in bx.select_dtypes(include=[np.number]).columns}),
-                width="stretch",
-                height=_auto_height(bx, max_px=760),
-            )
-
-    st.divider()
-
-    # ----------------------- Minutes Rotation -----------------------
-    st.subheader("Minutes Rotation (Season vs Recent + Last 5 Games)")
-    last_n_3 = 3
-    last_n_10 = 10
-    last_n_user = 0 if roster_window == "Season" else int(roster_window.split()[-1])
-
-    with st.spinner("Loading roster snapshots..."):
-        season_roster_pg = league_players_stats_cached(season, per_mode="PerGame", last_n=0)
-        last3_pg = league_players_stats_cached(season, per_mode="PerGame", last_n=last_n_3)
-        last10_pg = league_players_stats_cached(season, per_mode="PerGame", last_n=last_n_10)
-
-    if season_roster_pg.empty:
-        st.info("Roster data not available.")
-        return
-
-    season_team = season_roster_pg[season_roster_pg["TEAM_ID"] == team_id].copy()
-    last3_team = last3_pg[last3_pg["TEAM_ID"] == team_id].copy() if not last3_pg.empty else pd.DataFrame()
-    last10_team = last10_pg[last10_pg["TEAM_ID"] == team_id].copy() if not last10_pg.empty else pd.DataFrame()
-
-    roster_df = league_players_stats_cached(season, per_mode=roster_per_mode, last_n=last_n_user)
-    roster_df = roster_df[roster_df["TEAM_ID"] == team_id].copy() if roster_df is not None and not roster_df.empty else pd.DataFrame()
-
-    rot = season_team[["PLAYER_ID", "PLAYER_NAME", "MIN"]].copy()
-    rot = rot.rename(columns={"MIN": "MIN_season"})
-    if not last3_team.empty:
-        tmp = last3_team[["PLAYER_ID", "MIN"]].copy().rename(columns={"MIN": "MIN_last3"})
-        rot = rot.merge(tmp, on="PLAYER_ID", how="left")
-    else:
-        rot["MIN_last3"] = np.nan
-    if not last10_team.empty:
-        tmp = last10_team[["PLAYER_ID", "MIN"]].copy().rename(columns={"MIN": "MIN_last10"})
-        rot = rot.merge(tmp, on="PLAYER_ID", how="left")
-    else:
-        rot["MIN_last10"] = np.nan
+    for c in last5_cols:
+        if c in rot.columns:
+            rot[c] = pd.to_numeric(rot[c], errors="coerce").fillna(0.0)
 
     rot["MIN_season"] = pd.to_numeric(rot["MIN_season"], errors="coerce")
     rot["MIN_last3"] = pd.to_numeric(rot["MIN_last3"], errors="coerce")
     rot["MIN_last10"] = pd.to_numeric(rot["MIN_last10"], errors="coerce")
     rot = rot.sort_values("MIN_season", ascending=False).reset_index(drop=True)
 
-    display_cols = ["PLAYER_NAME", "MIN_last3", "MIN_last10", "MIN_season"]
+    display_cols = ["PLAYER_NAME", "MIN_last3", "MIN_last10", "MIN_season"] + last5_cols
     rot_disp = _ensure_cols(rot, display_cols)[display_cols].copy()
-    rot_disp = rot_disp.rename(columns={"MIN_last3": "MIN (Last 3)", "MIN_last10": "MIN (Last 10)", "MIN_season": "MIN (Season)"})
-
+    rot_disp = rot_disp.rename(
+        columns={
+            "MIN_last3": "MIN (Last 3)",
+            "MIN_last10": "MIN (Last 10)",
+            "MIN_season": "MIN (Season)",
+        }
+    )
     st.dataframe(
         rot_disp.style.format({c: "{:.1f}" for c in rot_disp.select_dtypes(include=[np.number]).columns}),
         width="stretch",
@@ -819,16 +1228,32 @@ def team_tab():
 
     st.divider()
 
-    # ----------------------- Roster Stats -----------------------
     st.subheader("Roster Stats (Interactive)")
     if roster_df.empty:
         st.info("No roster data returned for this view.")
         return
 
     roster_wanted = [
-        "PLAYER_NAME", "AGE", "GP", "MIN", "PTS", "REB", "AST",
-        "FGM", "FGA", "FG3M", "FG3A", "FTM", "FTA",
-        "OREB", "DREB", "STL", "BLK", "TOV", "PF", "PLUS_MINUS",
+        "PLAYER_NAME",
+        "AGE",
+        "GP",
+        "MIN",
+        "PTS",
+        "REB",
+        "AST",
+        "FGM",
+        "FGA",
+        "FG3M",
+        "FG3A",
+        "FTM",
+        "FTA",
+        "OREB",
+        "DREB",
+        "STL",
+        "BLK",
+        "TOV",
+        "PF",
+        "PLUS_MINUS",
     ]
     roster_df = _ensure_cols(roster_df, roster_wanted)[roster_wanted].copy()
     for c in roster_df.columns:
@@ -855,7 +1280,7 @@ def player_tab():
         season = st.selectbox("Season", SEASONS, index=0, key="pl_season")
     with p2:
         with st.spinner("Loading players..."):
-            pindex = league_players_index_cached(season)
+            pindex = get_league_players_index(season)
         if pindex.empty:
             st.error("Could not load player index for this season.")
             return
@@ -873,8 +1298,8 @@ def player_tab():
         window = st.selectbox("Window", ["Season", "Last 5", "Last 10", "Last 15"], index=0, key="pl_window")
 
     with st.spinner("Fetching player logs..."):
-        logs = player_logs_cached(player_id, season)
-        cpi = player_info_cached(player_id)
+        logs = get_player_logs(player_id, season)
+        cpi = get_common_player_info(player_id)
 
     if logs.empty:
         st.error("No game logs available for this player/season.")
@@ -981,8 +1406,23 @@ def player_tab():
     show["FG2M"] = (show["FGM"] - show["FG3M"]).clip(lower=0)
 
     keep_cols = [
-        "GAME_DATE", "MATCHUP", "WL", "MIN", "PTS", "REB", "AST", "PRA",
-        "FG2M", "FG3M", "FTM", "OREB", "DREB", "STL", "BLK", "TOV", "PF",
+        "GAME_DATE",
+        "MATCHUP",
+        "WL",
+        "MIN",
+        "PTS",
+        "REB",
+        "AST",
+        "PRA",
+        "FG2M",
+        "FG3M",
+        "FTM",
+        "OREB",
+        "DREB",
+        "STL",
+        "BLK",
+        "TOV",
+        "PF",
     ]
     show = _ensure_cols(show, keep_cols)[keep_cols].copy()
     st.dataframe(
@@ -1001,8 +1441,10 @@ def player_tab():
         st.caption("Compares: current season, previous season, career, last 5 games, last 20 games.")
 
     def get_single_player_dash(season_str: str, per_mode_str: str, last_n: int) -> pd.Series:
-        df = league_players_stats_cached(season_str, per_mode=per_mode_str, last_n=last_n)
-        if df is None or df.empty or "PLAYER_ID" not in df.columns:
+        df = fetch_league_players_stats(season_str, per_mode=per_mode_str, last_n_games=last_n)
+        if df is None or df.empty:
+            return pd.Series(dtype="float")
+        if "PLAYER_ID" not in df.columns:
             return pd.Series(dtype="float")
         row = df[df["PLAYER_ID"] == player_id]
         if row.empty:
@@ -1024,7 +1466,7 @@ def player_tab():
     last5_row = get_single_player_dash(season, comp_mode, 5)
     last20_row = get_single_player_dash(season, comp_mode, 20)
 
-    car = career_summary_cached(player_id)
+    car = get_career_summary(player_id)
 
     def extract_comp(row: pd.Series, label: str) -> Dict[str, float]:
         if row is None or row.empty:
