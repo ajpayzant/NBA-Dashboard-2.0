@@ -4,10 +4,12 @@ import os
 import time
 import json
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, Optional, List
 
 import pandas as pd
 
+# Persistent on-disk cache directory (created automatically at runtime).
+# In Streamlit Cloud this will exist inside the container filesystem.
 CACHE_DIR = os.environ.get("NBA_DASH_CACHE_DIR", "data_cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
@@ -16,6 +18,7 @@ DATA_EXT = ".parquet"
 
 
 def _safe_key(key: str) -> str:
+    # filesystem-safe key
     return "".join(c if c.isalnum() or c in ("-", "_", ".") else "_" for c in key)
 
 
@@ -81,37 +84,72 @@ def get_or_refresh(
     """
     Load from parquet if exists and not stale; otherwise fetch and store.
 
-    Critical safety:
-      - If the fresh fetch returns EMPTY, do NOT overwrite a non-empty cached file.
-        (This prevents transient NBA API throttles from "poisoning" cache.)
-      - Also avoids writing empty parquet files whenever possible.
+    normalize_fn is applied to the dataframe both when fetched and when read,
+    to prevent dtype drift from breaking merges.
     """
     df = None if force_refresh else read_parquet(key)
-
     if df is not None and normalize_fn is not None:
-        try:
-            df = normalize_fn(df)
-        except Exception:
-            pass
+        df = normalize_fn(df)
 
     if force_refresh or df is None or is_stale(key, ttl_seconds):
         fresh = fetch_fn()
         if normalize_fn is not None:
-            try:
-                fresh = normalize_fn(fresh)
-            except Exception:
-                pass
-
-        # SAFETY: don't overwrite good cache with empty fetch
-        if fresh is None or (hasattr(fresh, "empty") and fresh.empty):
-            # If we have a prior non-empty df, keep it
-            if df is not None and hasattr(df, "empty") and not df.empty:
-                return CacheResult(df=df, from_cache=True, refreshed=False)
-
-            # If both are empty, return empty but don't write empties
-            return CacheResult(df=fresh if fresh is not None else pd.DataFrame(), from_cache=False, refreshed=True)
-
+            fresh = normalize_fn(fresh)
         write_parquet(key, fresh)
         return CacheResult(df=fresh, from_cache=False, refreshed=True)
 
     return CacheResult(df=df, from_cache=True, refreshed=False)
+
+
+# -----------------------------------------------------------------------------
+# NEW: helpers for persistent cache maintenance (safe additive; doesn't affect app flow)
+# -----------------------------------------------------------------------------
+def delete_key(key: str) -> bool:
+    """Delete a single cached dataset + metadata. Returns True if anything was deleted."""
+    deleted = False
+    for p in (_data_path(key), _meta_path(key)):
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+                deleted = True
+        except Exception:
+            pass
+    return deleted
+
+
+def clear_cache_dir() -> int:
+    """Delete ALL parquet + meta files under CACHE_DIR. Returns number of files deleted."""
+    n = 0
+    try:
+        for fname in os.listdir(CACHE_DIR):
+            if fname.endswith(DATA_EXT) or fname.endswith(META_EXT):
+                try:
+                    os.remove(os.path.join(CACHE_DIR, fname))
+                    n += 1
+                except Exception:
+                    pass
+    except Exception:
+        return n
+    return n
+
+
+def list_cache_files() -> List[str]:
+    """List filenames currently stored in CACHE_DIR (debug/diagnostics)."""
+    try:
+        return sorted(os.listdir(CACHE_DIR))
+    except Exception:
+        return []
+
+
+# -----------------------------------------------------------------------------
+# NEW: disk-only reader for preloaded team boxscores
+# -----------------------------------------------------------------------------
+def read_boxscores(team_id: int, season: str) -> pd.DataFrame:
+    """
+    Read preloaded team boxscores (ALL games x ALL players for a team/season).
+    Produced by your preload script, stored as:
+      key = team_boxscores__{season}__{team_id}.parquet
+    """
+    key = f"team_boxscores__{season}__{int(team_id)}"
+    df = read_parquet(key)
+    return df if df is not None else pd.DataFrame()
