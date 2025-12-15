@@ -86,11 +86,22 @@ def get_or_refresh(
     if df is not None and normalize_fn is not None:
         df = normalize_fn(df)
 
+
     if force_refresh or df is None or is_stale(key, ttl_seconds):
         fresh = fetch_fn()
         if normalize_fn is not None:
             fresh = normalize_fn(fresh)
+
+        # SAFETY: don't overwrite a non-empty cached df with an empty fetch
+        # (common if NBA endpoint throttles or transiently fails)
+        if fresh is None or (hasattr(fresh, "empty") and fresh.empty):
+            if df is not None and hasattr(df, "empty") and not df.empty:
+                return CacheResult(df=df, from_cache=True, refreshed=False)
+            # If both are empty, just return empty (and avoid writing empty files)
+            return CacheResult(df=fresh if fresh is not None else pd.DataFrame(), from_cache=False, refreshed=True)
+
         write_parquet(key, fresh)
         return CacheResult(df=fresh, from_cache=False, refreshed=True)
+
 
     return CacheResult(df=df, from_cache=True, refreshed=False)
