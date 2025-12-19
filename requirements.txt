@@ -1,6 +1,7 @@
-streamlit>=1.36
-pandas>=2.1
-numpy>=1.26
-altair>=5.0
-nba_api>=1.4.1
-pyarrow>=14.0
+streamlit
+pandas
+numpy
+altair
+duckdb
+pyarrow
+nba_api
